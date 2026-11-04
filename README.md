@@ -16,9 +16,11 @@ Read this before using it. ag-workers reduces accidents; it is not a sandbox.
 
 What the tool does for you:
 
-- **A deny-rule guardrail (real but partial).** Each worker's agy session gets a `--settings` deny rule on the `write_file` tool (which also covers `edit_file`) for your main repo root, the git common dir if it is outside the root, `~/.ssh`, `~/.gnupg`, `~/.aws` and any `deny_write` paths. Read-mode workers are also denied their own worktree. This was verified to hold under `--dangerously-skip-permissions`.
-- **Detection after the fact.** `agw` flags file-tool writes outside the worktree, suspicious shell commands, any change to your main tree during the run, out-of-scope edits, and worker reports that do not match what changed.
-- **Review before integration.** Nothing reaches your working tree until `agw apply`, and `agw` never commits on your branches.
+- **A deny-rule guardrail (real but partial).** Each worker's agy session gets a `--settings` deny rule on the `write_file` tool (which also covers `edit_file`) for your main repo root, the git common dir if it is outside the root, `~/.ssh`, `~/.gnupg`, `~/.aws` and any `deny_write` paths. Read-mode workers are also denied their own worktree. The main-root deny covers every checkout in `git worktree list` that is not agw's: the primary checkout and your other linked worktrees. This was verified to hold under `--dangerously-skip-permissions`.
+- **Detection after the fact.** `agw` flags file-tool writes outside the worktree, suspicious shell commands, changes to tracked and untracked, non-ignored files of your main tree during the run (ignored files such as `.env` or `node_modules`, and changes inside dirty submodules, are not detected), a worker switching branches in its worktree, out-of-scope edits, and worker reports that do not match what changed.
+- **Review before integration.** Nothing reaches your working tree until `agw apply`, and `agw` never commits on your branches: it commits with git plumbing, so only `refs/heads/agw/<run>/<task>` ever moves.
+- **A private worktree root.** The worktree root is created with mode 0700 and checked: not a symlink, owned by you, no group or other permission bits. Otherwise `agw run` exits 2 and `agw doctor` fails the `worktree_dir` check (POSIX only).
+- **Careful cleanup.** `git worktree remove` is only run on real directories under agw's run root; symlinks are just unlinked.
 
 What does NOT protect you:
 
@@ -68,7 +70,7 @@ What Claude does:
 2. Decides what is worth delegating: tasks with a precise goal, a known scope and a way to check the result. Ambiguous, security-sensitive or tiny changes stay with Claude.
 3. Writes structured tasks (goal, context, files, steps, scope, constraints, accept). Each task is `read` (explore and report; file-writing tools are disabled) or `edit` (change code). `agw` renders them into one fixed, unambiguous brief for Gemini.
 4. Starts `agw run` in the background and gets one compact summary back when it finishes.
-5. Verifies cheapest first: trusts clean `[ok]` results with passing acceptance commands, and investigates anything failed or flagged with `agw show`.
+5. Verifies cheapest first: trusts clean `[ok]` results with passing acceptance commands (an edit with `accept: none` is unverified, so it reads the diff), and investigates anything failed or flagged with `agw show`.
 6. Integrates good edit tasks with `agw apply` (uncommitted, one task at a time), then runs your tests.
 7. Retries a failed task with a refined brief (at most `retry_limit` times) or takes it over, then runs `agw clean <run>` and reports back.
 
@@ -93,13 +95,13 @@ Claude writes tasks JSON ---> agw run (background)
 Claude: verify by tiers --> agw show --> agw apply --> run tests --> agw clean
 ```
 
-- Every worker runs in its own git worktree, created outside your repository under `<system temp>/agw-<user>/` (configurable with `worktree_dir`).
+- Every worker runs in its own git worktree, created outside your repository under `<system temp>/agw-<user>/` (configurable with `worktree_dir`). Worktrees hold only tracked files, from the base commit (`HEAD`): uncommitted edits are invisible unless `snapshot_dirty` is set.
 - For edit tasks, the result is committed on the branch `agw/<run>/<task>` and saved as `diff.patch`. The worktree is removed as soon as the task finishes; the branch survives.
-- Read tasks run in a detached worktree. Any changes a read worker makes are discarded and flagged.
-- `agw apply RUN TASK` applies the task's patch to your working tree (`git apply`, falling back to `git apply --3way`) and does not commit.
+- Read tasks run in a detached worktree. Any changes a read worker makes are discarded and flagged. Cache artifacts (`__pycache__/`, `*.pyc`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`) are excluded from patches and ignored for `READ_MODE_CHANGES` and `SCOPE_VIOLATION`.
+- `agw apply RUN TASK` applies the task's patch to your working tree (`git apply`, falling back to `git apply --3way`) and does not commit. It prints `(1 file)` or `(N files)`.
 - Run state lives in `<git common dir>/agw/runs/<run_id>/`, inside `.git`, so it never shows up in `git status`.
 - A quota error stops new tasks from starting (they become `skipped`); an auth error aborts the run with exit code 3.
-- agw retries transient agy errors once on its own. Refined retries are driven by Claude, and `agw` enforces the `attempt` limit.
+- agw retries transient agy errors once on its own. The first attempt's events are kept as `events.1.ndjson`, and tool calls and usage from both attempts are merged for flags and totals. Git operations are retried only on "Unable to create '...lock'" errors; `git apply` is never retried. Refined retries are driven by Claude, and `agw` enforces the `attempt` limit.
 
 ## The agw CLI
 
@@ -109,10 +111,10 @@ The plugin puts `agw` on the Bash tool's PATH while it is enabled. You can also 
 |---|---|
 | `agw --version` | print `agw 0.1.0` |
 | `agw run [TASKS] [--model M] [--parallel N] [--progress]` | run a tasks file (`TASKS` is a path or `-` for stdin; default `-`) and print the compact summary. `--parallel` is 1-8. `--progress` prints one line per task start and finish on stderr. |
-| `agw show [RUN [TASK] [--diff\|--log\|--brief\|--events\|--report]]` | with no arguments, list the 20 newest runs; with `RUN`, print its summary; with `RUN TASK`, print full task detail or one of the artifacts |
+| `agw show [RUN [TASK] [--diff\|--log\|--brief\|--events\|--report]]` | with no arguments, list the 20 newest runs; with `RUN`, print its summary; with `RUN TASK`, print full task detail or one of the artifacts. `--log` prints the acceptance log, plus setup.log under `== setup ==` and the tail of agy stderr under `== agy stderr ==`, when present |
 | `agw apply RUN TASK` | apply an edit task's patch to the working tree without committing |
-| `agw clean [RUN] [--all]` | with no arguments, mark dead runs abandoned and remove stale worktrees; with `RUN` or `--all`, also remove the run's branches and records |
-| `agw doctor [--live]` | check python, git, agy, config, repo, worktree dir and the write-deny guardrail; `--live` also makes one real agy call. Exit 0 unless a check FAILs (then 3) |
+| `agw clean [RUN] [--all] [--force]` | with no arguments, mark dead runs abandoned and remove stale worktrees; with `RUN` or `--all`, also remove the run's branches and records. Liveness is the pid plus the process start time; `--force` removes runs that look alive (and warns) |
+| `agw doctor [--live]` | check python, git, agy, config, repo, worktree dir (including its 0700 ownership check) and the write-deny guardrail; `--live` also makes one real agy call. Exit 0 unless a check FAILs (then 3) |
 | `agw config` | print the effective config with the source of each value |
 
 `RUN` may be the literal `last`, meaning the newest run in this repository. `agw run` must be started from inside the git repository.
@@ -137,20 +139,21 @@ Each task prints `[status] id mode "title" duration attempt a/max`, followed by 
 |---|---|
 | `OUT_OF_SCOPE_WRITE` | a file tool wrote outside the task's worktree |
 | `SUSPICIOUS_COMMAND` | a shell command that looks like a git state change or a write outside the worktree |
-| `MAIN_TREE_CHANGED` | your main tree changed during the run (may have been you or Claude) |
+| `MAIN_TREE_CHANGED` | tracked or untracked, non-ignored files of your main tree changed during the run (may have been you or Claude). Ignored files such as `.env` or `node_modules`, and changes inside dirty submodules, are not detected |
+| `BRANCH_SWITCHED` | the worker switched branches in its worktree; review the diff before applying |
 | `READ_MODE_CHANGES` | a read worker changed files; the changes were discarded |
 | `SCOPE_VIOLATION` | an edit touched a path outside the task's `scope` |
 | `REPORT_MISMATCH`, `NO_REPORT` | the worker's report is wrong or missing; rely on the diff and acceptance results |
 | `BLOCKED_ACTIONS` | the worker reported actions it could not perform |
 | `OVERLAP` | two edit tasks changed the same path; expect conflicts on apply |
 
-Informational flags: `NO_CHANGES`, `LARGE_DIFF`, `DELETED_FILES`, `DIRTY_BASE`, `DENY_RULE_DROPPED`.
+Informational flags: `NO_CHANGES`, `LARGE_DIFF`, `DELETED_FILES`, `DIRTY_BASE`, `DENY_RULE_DROPPED`, and `NO_ACCEPT` (an edit task with no acceptance commands: "edit not verified by any acceptance command; review the diff").
 
 ## Tasks file
 
 `agw run` reads UTF-8 JSON. Every validation error is reported at once as `<json path>: <message>`, and unknown keys are errors.
 
-Top-level keys: `tasks` (required, 1 to 20 items), `version` (optional, must be `1`), `base` (git ref to start from, default `HEAD`), `snapshot_dirty` (default `false`; if true, workers start from a snapshot of uncommitted changes to tracked files, never untracked files; requires `base` `HEAD`) and `context` (shared paragraphs prepended to every task).
+Top-level keys: `tasks` (required, 1 to 20 items), `version` (optional, must be `1`), `base` (git ref to start from, default `HEAD`), `snapshot_dirty` (default `false`; if true, workers start from a snapshot of uncommitted changes to tracked files, never untracked files; requires `base` `HEAD`; if `git stash create` fails the run exits 2 instead of silently falling back to `HEAD`) and `context` (shared paragraphs prepended to every task).
 
 Task fields:
 
@@ -226,9 +229,9 @@ A missing file is fine. The environment variable `AGW_AGY`, if set, replaces `ag
 | `accept` | list of strings | `[]` | default acceptance commands for edit tasks without `accept` |
 | `accept_timeout_seconds` | int | `600` | 10-7200; per acceptance command |
 | `setup` | list of strings | `[]` | shell commands run in each new worktree before the worker starts |
-| `deny_write` | list of strings | `["~/.ssh", "~/.gnupg", "~/.aws"]` | extra paths that file tools may not write (`~` expanded); added to the built-in main-root deny |
+| `deny_write` | list of strings | `["~/.ssh", "~/.gnupg", "~/.aws"]` | extra paths that file tools may not write (`~` expanded; relative paths resolve against the directory of the config file that set them); added to the built-in deny of the main root and your other checkouts |
 | `agy_path` | string or list of strings | `"agy"` | executable, or argv prefix |
-| `worktree_dir` | string | `""` | `""` means `<system temp dir>/agw-<user>`; `~` expanded |
+| `worktree_dir` | string | `""` | `""` means `<system temp dir>/agw-<user>`; `~` expanded; a relative path resolves against the directory of the config file that set it. Created with mode 0700 and checked (see the safety model) |
 
 Setup and acceptance commands run through the shell in the worktree and get the extra environment variables `AGW_MAIN_ROOT`, `AGW_WORKTREE`, `AGW_RUN_ID` and `AGW_TASK_ID`.
 
@@ -252,7 +255,7 @@ setup = ["ln -s \"$AGW_MAIN_ROOT/node_modules\" node_modules"]
 
 How it saves money: Claude spends tokens on planning one structured task file, reading one compact summary and checking the risky parts. Gemini workers spend the tokens on the bulk reading, editing and test-running. Several things keep Claude's side small:
 
-- Always-on cost is just the skill description, about 84 Claude tokens. The skill body loads only when you invoke `/ag-workers:delegate`, and there is no MCP server whose tool definitions would sit in every session.
+- Always-on cost: Claude Code reports ~84 tokens always-on for this plugin (`claude plugin details ag-workers`, an estimate). The Claude Code docs, however, say a skill with `disable-model-invocation: true` has its "description not in context", so the real figure may be lower; this README does not claim more than the reported estimate. The skill body (~2.5k tokens, as reported) loads only when you invoke `/ag-workers:delegate`, and there is no MCP server whose tool definitions would sit in every session.
 - One Bash call starts a run, and one compact summary comes back. Details (`agw show`) are read only when needed.
 - Claude writes structured fields and `agw` renders the full brief, so Claude writes less.
 - Acceptance commands run inside `agw`, so Claude does not spend turns running them.
@@ -265,8 +268,10 @@ Where it costs: each worker uses roughly 15-50k Gemini input tokens even for tin
 - **Auth failure (exit 3)**: run `agy` and log in again, then rerun.
 - **Quota or rate limit**: the failing task is an error and the unstarted tasks are `skipped`. Wait, then rerun the affected tasks. The quota and auth error shapes are matched heuristically because they could not be triggered during testing.
 - **Timeouts**: split the task, or set a larger `timeout_seconds` on the task or in config. Edit changes from a timed-out worker are still committed to its branch for inspection.
-- **Missing dependencies in worktrees** (`node_modules`, `.venv`, and so on): worktrees contain only tracked files. Use `setup` in config to symlink or install them, for example the `.agw.toml` shown above.
-- **Stale worktrees or branches**: `agw clean` removes worktrees of dead runs; `agw clean <run>` or `agw clean --all` also removes branches `agw/<run>/*` and run records.
+- **Missing dependencies in worktrees** (`node_modules`, `.venv`, and so on): worktrees contain only tracked files, so acceptance commands fail with "command not found" or import errors. Use `setup` in config to symlink or install them, for example the `.agw.toml` shown above, or have acceptance commands use the main tree's tools through `$AGW_MAIN_ROOT`, e.g. `"$AGW_MAIN_ROOT/.venv/bin/python" -m pytest -q tests/test_x.py`.
+- **Worker does not see my uncommitted edits**: workers start from the base commit. Commit first, or set `"snapshot_dirty": true` in the tasks file (tracked files only).
+- **`agw run` exits 2, or `agw doctor` fails the `worktree_dir` check**: the directory must be a real directory owned by you with mode 0700 (no group or other bits, not a symlink). Fix the permissions or choose another `worktree_dir`.
+- **Stale worktrees or branches**: `agw clean` removes worktrees of dead runs; `agw clean <run>` or `agw clean --all` also removes branches `agw/<run>/*` and run records. A run that looks alive but is stuck can be removed with `--force`.
 - **Invalid model**: agy reports `invalid model selection`; set a valid `model` (list them with `agy models`).
 - **Config or tasks errors (exit 2)**: every error is listed, one per line.
 

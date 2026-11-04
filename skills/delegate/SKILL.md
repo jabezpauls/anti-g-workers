@@ -27,6 +27,10 @@ Keep the work yourself when: you already know the small change (a brief would co
 
 Use `"mode": "read"` (the default) for exploration: file-writing tools are disabled and the `findings` are the result. Use `"mode": "edit"` for code changes. Tasks in one run execute in parallel, so they must be independent and must not edit the same files. Put dependent work in a later run.
 
+Workers see the base commit (HEAD), not uncommitted edits. If tasks depend on uncommitted tracked changes, set top-level `"snapshot_dirty": true` in the tasks file (untracked files are never included), or commit first.
+
+Worktrees contain ONLY tracked files: no `.venv`, `node_modules` or build outputs. Check `agw config` for `setup`. If there is none, write `accept` commands that use the main tree's tools via `$AGW_MAIN_ROOT` (exported to agy, setup and acceptance commands), e.g. `"$AGW_MAIN_ROOT/.venv/bin/python" -m pytest -q tests/test_x.py`.
+
 ## 3. Write the tasks
 Gemini performs well only with explicit, structured instructions. agw turns your fields into a fixed brief.
 - `goal`: 1-2 sentences describing the outcome: what is true when done.
@@ -35,12 +39,12 @@ Gemini performs well only with explicit, structured instructions. agw turns your
 - `steps`: ordered, concrete, imperative, one action each. Name the exact files, functions and signatures.
 - `scope` (edit): globs of the files it may change. Keep it tight.
 - `constraints`: must / must-not rules (no new dependencies, keep the public API, style).
-- `accept` (edit): fast, targeted commands that prove it works (for example one test file). If omitted, the configured defaults apply.
+- `accept` (edit): fast, targeted commands that prove it works (for example one test file). If omitted, the configured defaults apply. With none, the edit is unverified (`accept: none`, flag `NO_ACCEPT`).
 - `report` (optional): what the findings must cover. For read tasks, the exact questions.
-- `model` (optional): the default comes from config. Use a cheaper model for trivial tasks.
+- `model` (optional): default `gemini-3.8-flash-high`; cheaper `gemini-3.8-flash-low` for trivial tasks; stronger `gemini-4-argon-high` for hard ones. `agy models` lists them; never invent names.
 Never use vague verbs ("improve", "clean up", "handle properly"); say exactly what to change.
 
-Start the run in the background (Bash with `run_in_background: true` and `timeout: 7200000`), passing JSON on stdin:
+Start the run in the background (Bash with `run_in_background: true`). Claude Code caps background commands at 2 h, so keep each run well under it: estimate ceil(tasks / parallel) × timeout (config `max_parallel`, `timeout_seconds`) and split big task sets into several runs. Pass JSON on stdin:
 
 ```bash
 agw run - <<'AGW_TASKS'
@@ -76,11 +80,11 @@ While it runs, don't edit files the workers are working on, and don't redo their
 
 ## 4. Verify, cheapest first
 The run ends with a compact summary. For each task:
-- `[ok]` and no `flags:` line: trust the acceptance result. For edit tasks, read the diff (`agw show <run> <task> --diff`) only if the area is risky: security, data migrations, concurrency, public API, or deleted files.
-- `[failed]`, `[error]`, `[timeout]`, or any `flags:` line: investigate before acting, with `agw show <run> <task>` (details), `--log` (acceptance output) and `--diff`.
+- `[ok]`, no `flags:` line, and `accept: pass`: trust the acceptance result. `accept: none` / `NO_ACCEPT` on an edit task means it is unverified: read the diff. For other edit tasks, read the diff (`agw show <run> <task> --diff`) only if the area is risky: security, data migrations, concurrency, public API, or deleted files.
+- `[failed]`, `[error]`, `[timeout]`, or any `flags:` line: investigate before acting, with `agw show <run> <task>` (details), `--log` (acceptance output, plus setup and agy stderr) and `--diff`.
 - Read tasks: the `findings` are the answer. Spot-check one or two concrete claims (open the cited file:line) before relying on them.
 - `OUT_OF_SCOPE_WRITE`, `SUSPICIOUS_COMMAND`, `MAIN_TREE_CHANGED`: check what changed outside the worktree (`git status`, plus the listed paths) and tell the user.
-- `SCOPE_VIOLATION`: read the out-of-scope hunks. `REPORT_MISMATCH` / `NO_REPORT`: don't trust the report; rely on the diff and the acceptance results. `READ_MODE_CHANGES`: the changes were discarded; usually harmless. `OVERLAP`: expect conflicts when applying.
+- `SCOPE_VIOLATION`: read the out-of-scope hunks. `BRANCH_SWITCHED` (worker switched branches in its worktree): review the diff before applying. `REPORT_MISMATCH` / `NO_REPORT`: don't trust the report; rely on the diff and the acceptance results. `READ_MODE_CHANGES`: the changes were discarded; usually harmless. `OVERLAP`: expect conflicts when applying.
 
 ## 5. Integrate
 For each good edit task, run `agw apply <run> <task>`. This applies the patch to the working tree without committing. Apply tasks one at a time, and resolve any reported conflicts yourself. Then run the project's tests in the main tree. Don't commit unless the user asked you to.
