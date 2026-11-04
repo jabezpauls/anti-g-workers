@@ -185,7 +185,7 @@ def test_out_of_scope_write_is_flagged(agw_env: AgwEnv) -> None:
     agw_env.set_scenarios(default={**EDIT_OK, "extra_events": [ev]})
     result, _, _ = go(agw_env, [edit_task()])
     t = result.tasks[0]
-    assert [f.code for f in t.flags] == ["OUT_OF_SCOPE_WRITE"]
+    assert [f.code for f in t.flags] == ["OUT_OF_SCOPE_WRITE", "NO_ACCEPT"]
     assert str(agw_env.outside) in t.flags[0].detail
     assert result.exit_code == EXIT_TASKS_FAILED
 
@@ -663,11 +663,220 @@ def test_worker_commit_and_revert_leaves_no_branch(agw_env: AgwEnv) -> None:
     assert list_branches(repo) == [] and worktree_dirs(agw_env) == []
 
 
-def test_unwritable_worktree_dir_is_a_task_error(agw_env: AgwEnv, tmp_path) -> None:
+def test_unwritable_worktree_dir_is_a_usage_error(agw_env: AgwEnv, tmp_path) -> None:
     blocker = tmp_path / "blocker"
     blocker.write_text("a file, not a directory", encoding="utf-8")
-    result, repo, _ = go(agw_env, [edit_task(), read_task()], cfg={"worktree_dir": str(blocker / "wt")})
-    for t in result.tasks:
-        assert t.status == "error" and t.reason.startswith("cannot create the worktree directory:")
-    assert agw_env.calls() == [] and list_branches(repo) == []
+    with pytest.raises(runner.RunError) as info:
+        go(agw_env, [edit_task(), read_task()], cfg={"worktree_dir": str(blocker / "wt")})
+    assert info.value.exit_code == 2 and "worktree_dir" in str(info.value)
+    assert agw_env.calls() == []
+
+
+# ---- review fixes: branch switching, secure root, evidence, cleanup, cache, pid reuse ------------------------
+
+def _branch_names(env: AgwEnv) -> set[str]:
+    return set(run_git(["for-each-ref", "--format=%(refname:short)", "refs/heads"], env.repo).split())
+
+
+@posix_only
+@pytest.mark.parametrize("switch", ["git checkout -q -b other", "git checkout -q develop"])
+def test_worker_switching_branches_never_gets_an_agw_commit_there(agw_env: AgwEnv, switch: str) -> None:
+    run_git(["branch", "develop"], agw_env.repo)
+    develop_before = run_git(["rev-parse", "develop"], agw_env.repo).strip()
+    agw_env.set_scenarios(default={"actions": [{"shell": switch}, WRITE_APP], "structured_output": REPORT_DONE})
+    result, repo, _ = go(agw_env, [edit_task()])
+    t = result.tasks[0]
+    branch = f"agw/{result.run_id}/t1"
+    assert t.status == "ok" and t.branch == branch
+    assert run_git(["rev-parse", "develop"], agw_env.repo).strip() == develop_before
+    assert "other" not in _branch_names(agw_env) or \
+        run_git(["rev-parse", "other"], agw_env.repo).strip() == t.base_sha
+    assert run_git(["diff", "--name-only", t.base_sha, branch], agw_env.repo).split() == ["app.py"]
+    assert "app.py" in (runner.runs_root(repo) / result.run_id / "t1" / "diff.patch").read_text(encoding="utf-8")
+    flag = next(f for f in t.flags if f.code == "BRANCH_SWITCHED")
+    assert flag.level == "warn" and ("other" in flag.detail or "develop" in flag.detail)
     assert result.exit_code == EXIT_TASKS_FAILED
+
+
+def test_insecure_worktree_root_is_refused(agw_env: AgwEnv) -> None:
+    agw_env.worktree_dir.chmod(0o755)
+    with pytest.raises(runner.RunError) as info:
+        go(agw_env, [read_task()])
+    assert info.value.exit_code == 2 and "chmod 700" in str(info.value)
+    assert agw_env.calls() == []
+
+
+def test_symlinked_worktree_root_is_refused(agw_env: AgwEnv, tmp_path) -> None:
+    link = tmp_path / "wt-link"
+    link.symlink_to(agw_env.worktree_dir)
+    with pytest.raises(runner.RunError) as info:
+        go(agw_env, [read_task()], cfg={"worktree_dir": str(link)})
+    assert info.value.exit_code == 2 and "symlink" in str(info.value)
+
+
+def test_missing_worktree_root_is_created_private(agw_env: AgwEnv, tmp_path) -> None:
+    fresh = tmp_path / "fresh" / "wts"
+    go(agw_env, [read_task()], cfg={"worktree_dir": str(fresh)})
+    assert (os.stat(fresh).st_mode & 0o777) == 0o700
+
+
+def test_retry_keeps_first_attempt_evidence(agw_env: AgwEnv) -> None:
+    flaky = {"fixture": "write-and-run.ndjson", "exit_code": 1, "result_status": "ERROR", "error": "hiccup",
+             "structured_output": None,
+             "stderr": 'AGY_ERROR: {"short_error":"x","status":"UNAVAILABLE","retryable":true}\n'}
+    agw_env.set_scenarios(tasks={"r1": [flaky, {}]})
+    result, repo, _ = go(agw_env, [read_task()])
+    t = result.tasks[0]
+    task_dir = runner.runs_root(repo) / result.run_id / "r1"
+    assert t.status == "ok"
+    assert "write_file" in (task_dir / "events.1.ndjson").read_text(encoding="utf-8")
+    assert "UNAVAILABLE" in (task_dir / "agy.stderr.1.txt").read_text(encoding="utf-8")
+    assert [c.name for c in t.commands] == ["run_command", "run_command"]       # from the failed first attempt
+    assert t.usage["total_tokens"] > 35869
+
+
+def test_retry_first_attempt_writes_outside_are_still_flagged(agw_env: AgwEnv) -> None:
+    ev = {"event": "step_update", "step_update": {"step_index": 5, "state": "DONE", "step_type": "tool",
+          "tool_name": "write_file", "tool_info": {"name": "write_file", "parameters": {"Path": "__OUTSIDE__/x"}}}}
+    flaky = {"exit_code": 1, "result_status": "ERROR", "error": "hiccup", "structured_output": None,
+             "extra_events": [ev],
+             "stderr": 'AGY_ERROR: {"short_error":"x","status":"UNAVAILABLE","retryable":true}\n'}
+    agw_env.set_scenarios(tasks={"r1": [flaky, {}]})
+    result, _, _ = go(agw_env, [read_task()])
+    assert "OUT_OF_SCOPE_WRITE" in [f.code for f in result.tasks[0].flags]
+
+
+def _settings_denies(env: AgwEnv, result, repo, task: str) -> list[str]:
+    path = runner.runs_root(repo) / result.run_id / task / "agy-settings.json"
+    return json.loads(path.read_text(encoding="utf-8"))["permissions"]["deny"]
+
+
+def test_deny_rules_cover_primary_and_other_linked_worktrees(agw_env: AgwEnv, tmp_path, monkeypatch) -> None:
+    linked = tmp_path / "linked"
+    other = tmp_path / "other-linked"
+    run_git(["worktree", "add", "-q", "-b", "lw", str(linked)], agw_env.repo)
+    run_git(["worktree", "add", "-q", "-b", "ow", str(other)], agw_env.repo)
+    monkeypatch.chdir(linked)
+    env_cfg = agw_env
+    env_cfg.write_config()
+    repo = repo_info(str(linked))
+    config = load_config(repo.main_root, None)
+    result = runner.execute_run(TaskSet(tasks=[edit_task()]), config, repo, retry_delay=0)
+    denies = _settings_denies(agw_env, result, repo, "t1")
+    for path in (agw_env.repo, os.path.realpath(other), os.path.realpath(linked)):
+        assert f"write_file({path})" in denies
+    assert not any(str(agw_env.worktree_dir) in d for d in denies)
+
+
+@posix_only
+def test_symlink_in_run_root_is_unlinked_not_followed(agw_env: AgwEnv) -> None:
+    victim = agw_env.outside / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("keep", encoding="utf-8")
+    agw_env.set_scenarios(default={"actions": [{"shell": f"ln -s {victim} ../evil"}], "structured_output": REPORT_DONE})
+    result, _, _ = go(agw_env, [read_task()])
+    assert result.tasks[0].status == "ok"
+    assert (victim / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert worktree_dirs(agw_env) == []
+
+
+@posix_only
+def test_symlinked_run_root_is_not_followed_by_cleanup(agw_env: AgwEnv) -> None:
+    repo, config = setup(agw_env)
+    victim = agw_env.outside / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("keep", encoding="utf-8")
+    slug = pathlib.Path(config.worktree_dir) / runner.repo_slug(repo.main_root)
+    slug.mkdir()
+    (slug / "20260101-000000-beef").symlink_to(victim)
+    fake_stale_run(repo, "20260101-000000-beef")
+    runner.clean(repo, config)
+    runner.clean(repo, config, "20260101-000000-beef")
+    assert (victim / "keep.txt").is_file()
+
+
+@posix_only
+def test_cache_artifacts_are_not_changes_or_patch_content(agw_env: AgwEnv) -> None:
+    pyc = {"shell": "mkdir -p __pycache__ && printf 'x' > __pycache__/x.pyc"}
+    agw_env.set_scenarios(tasks={"t1": {"actions": [pyc, WRITE_APP], "structured_output": REPORT_DONE},
+                                 "r1": {"actions": [pyc], "structured_output": REPORT_DONE}})
+    result, repo, _ = go(agw_env, [edit_task(scope=["app.py"]), read_task()], cfg={"max_parallel": 1})
+    edit_res = result.tasks[0]
+    patch = (runner.runs_root(repo) / result.run_id / "t1" / "diff.patch").read_text(encoding="utf-8")
+    assert "pyc" not in patch and "__pycache__" not in patch
+    codes = [f.code for t in result.tasks for f in t.flags]
+    assert "SCOPE_VIOLATION" not in codes and "READ_MODE_CHANGES" not in codes
+    assert edit_res.status == "ok"
+    assert not (agw_env.repo / ".gitignore").exists()
+
+
+def test_cache_only_edit_is_no_changes(agw_env: AgwEnv) -> None:
+    agw_env.set_scenarios(default={"actions": [{"write": "__pycache__/x.pyc", "content": "x"}],
+                                   "structured_output": REPORT_DONE})
+    result, _, _ = go(agw_env, [edit_task()])
+    assert result.tasks[0].status == "failed" and result.tasks[0].reason == "no changes"
+
+
+def test_no_accept_is_an_info_flag_and_keeps_exit_zero(agw_env: AgwEnv) -> None:
+    agw_env.set_scenarios(default=EDIT_OK)
+    result, _, _ = go(agw_env, [edit_task()])
+    flag = next(f for f in result.tasks[0].flags if f.code == "NO_ACCEPT")
+    assert flag.level == "info" and flag.detail == "edit not verified by any acceptance command; review the diff"
+    assert result.exit_code == EXIT_OK
+    result, _, _ = go(agw_env, [edit_task(accept=["true"])])
+    assert "NO_ACCEPT" not in [f.code for f in result.tasks[0].flags]
+
+
+def test_snapshot_dirty_stash_failure_is_a_usage_error(agw_env: AgwEnv, monkeypatch) -> None:
+    from agw import gitops
+    (agw_env.repo / "app.py").write_text("dirty\n", encoding="utf-8")
+    real = gitops.git
+
+    def broken(args, cwd, **kw):
+        if "stash" in args:
+            return subprocess.CompletedProcess(args, 128, "", "fatal: stash is broken")
+        return real(args, cwd, **kw)
+
+    monkeypatch.setattr(gitops, "git", broken)
+    with pytest.raises(runner.RunError, match="stash is broken") as info:
+        go(agw_env, [read_task()], taskset_kw={"snapshot_dirty": True})
+    assert info.value.exit_code == 2
+
+
+def test_pid_reuse_is_detected_by_start_time() -> None:
+    token = runner.process_start_time(os.getpid())
+    if token is None:
+        pytest.skip("no process start time on this platform")
+    assert runner.is_run_alive({"status": "running", "pid": os.getpid(), "pid_start": token})
+    assert not runner.is_run_alive({"status": "running", "pid": os.getpid(), "pid_start": token + "0"})
+    assert runner.is_run_alive({"status": "running", "pid": os.getpid()})       # old records: pid only
+
+
+def test_run_records_the_process_start_time(agw_env: AgwEnv) -> None:
+    result, repo, _ = go(agw_env, [read_task()])
+    data = json.loads((runner.runs_root(repo) / result.run_id / "run.json").read_text(encoding="utf-8"))
+    token = runner.process_start_time(os.getpid())
+    assert data.get("pid_start", None) == (token or None) or token is None
+
+
+def test_clean_force_removes_alive_runs_with_a_warning(agw_env: AgwEnv, capsys) -> None:
+    repo, config = setup(agw_env)
+    alive = fake_stale_run(repo, "20260101-000001-aaaa", pid=os.getpid())
+    msg = runner.clean(repo, config, "20260101-000001-aaaa", force=True)
+    assert msg.startswith("removed run 20260101-000001-aaaa") and not alive.exists()
+    assert "--force" in capsys.readouterr().err
+    alive = fake_stale_run(repo, "20260101-000002-bbbb", pid=os.getpid())
+    assert runner.clean(repo, config, all_runs=True, force=True) == "removed 1 run(s), 0 branch(es)"
+    assert not alive.exists() and "--force" in capsys.readouterr().err
+
+
+def test_clean_removes_the_empty_slug_directory(agw_env: AgwEnv) -> None:
+    result, repo, config = go(agw_env, [read_task()])
+    slug = pathlib.Path(config.worktree_dir) / runner.repo_slug(repo.main_root)
+    assert slug.is_dir()
+    runner.clean(repo, config)
+    assert not slug.exists()
+    result, repo, config = go(agw_env, [read_task()])
+    (slug / "keepme").mkdir()
+    runner.clean(repo, config, all_runs=True)
+    assert (slug / "keepme").is_dir()

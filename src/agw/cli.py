@@ -19,7 +19,8 @@ from typing import NoReturn
 
 from agw import __version__, runner
 from agw.agy import check_available, live_check, parse_stream
-from agw.config import PROJECT_CONFIG_NAME, ConfigError, default_worktree_dir, load_config, render_config, user_config_path
+from agw.config import (PROJECT_CONFIG_NAME, ConfigError, default_worktree_dir, load_config, render_config,
+                        user_config_path, worktree_dir_problem)
 from agw.gitops import GitError, RepoInfo, apply_patch, repo_info
 from agw.models import (EXIT_ENV, EXIT_INTERRUPTED, EXIT_OK, EXIT_TASKS_FAILED, EXIT_USAGE, Config, task_result_from_dict,
                         to_jsonable)
@@ -205,6 +206,36 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 # ---- show ----------------------------------------------------------------------------------------------------------
 
+MAX_LOG_LINES = 200
+
+
+def _tail_text(text: str, limit: int = MAX_LOG_LINES) -> str:
+    """The last `limit` lines of text, with a marker line when earlier lines were left out."""
+    lines = text.splitlines()
+    if len(lines) <= limit:
+        return text if text.endswith("\n") else text + "\n"
+    return f"[... {len(lines) - limit} earlier lines omitted ...]\n" + "\n".join(lines[-limit:]) + "\n"
+
+
+def _log_view(task_dir: str) -> str:
+    """`show --log`: setup log, acceptance log and the tail of agy's stderr, each under its own header."""
+    setup = _read_text(os.path.join(task_dir, "setup.log"))
+    accept = _read_text(os.path.join(task_dir, "accept.log"))
+    stderr = _read_text(os.path.join(task_dir, "agy.stderr.txt"))
+    sections: list[tuple[str, str]] = []
+    if setup:
+        sections.append(("setup", setup))
+    if accept:
+        sections.append(("acceptance", accept))
+    if stderr and stderr.strip():
+        sections.append(("agy stderr", stderr))
+    if not sections:
+        return "(no acceptance log)\n"
+    if len(sections) == 1 and sections[0][0] == "acceptance":
+        return _tail_text(accept or "")
+    return "".join(f"== {title} ==\n{_tail_text(body)}" for title, body in sections)
+
+
 _SHOW_VIEWS = ("diff", "log", "brief", "events", "report")
 
 
@@ -237,7 +268,7 @@ def cmd_show(args: argparse.Namespace) -> int:
     elif view == "diff":
         _emit(_read_text(os.path.join(task_dir, "diff.patch")) or "(no diff)\n")
     elif view == "log":
-        _emit(_read_text(os.path.join(task_dir, "accept.log")) or "(no acceptance log)\n")
+        _emit(_log_view(task_dir))
     elif view == "brief":
         _emit(_read_text(os.path.join(task_dir, "brief.md")) or "(no brief)\n")
     elif view == "events":
@@ -263,7 +294,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
     how, stderr = apply_patch(repo.main_root, patch)
     if how == "applied":
         count = len(result.diff.files) if result.diff else 0
-        _emit(f"applied {args.task} ({count} files) to working tree; not committed\n")
+        _emit(f"applied {args.task} ({count} {'file' if count == 1 else 'files'}) to working tree; not committed\n")
         return EXIT_OK
     if how == "applied-3way":
         _emit(f"applied {args.task} with 3-way merge; changes are staged; not committed\n")
@@ -283,7 +314,7 @@ def cmd_clean(args: argparse.Namespace) -> int:
     repo = _repo()
     config = _config(repo)
     try:
-        message = runner.clean(repo, config, args.run, args.all)
+        message = runner.clean(repo, config, args.run, args.all, force=args.force)
     except KeyError:
         raise _fail("no runs in this repository" if args.run == "last" else f"unknown run '{args.run}'",
                     EXIT_USAGE) from None
@@ -403,7 +434,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         add("ok", "repo", f"{repo.main_root} ({repo.branch or 'detached HEAD'} @ {repo.head_sha[:7]})")
 
     worktree_dir = config.worktree_dir if config is not None else default_worktree_dir()
-    problem = _directory_problem(worktree_dir)
+    problem = _directory_problem(worktree_dir) or worktree_dir_problem(worktree_dir)
     add("FAIL" if problem else "ok", "worktree_dir", f"{worktree_dir}: {problem}" if problem else worktree_dir)
 
     if repo is not None and path_within(worktree_dir, repo.main_root):
@@ -469,6 +500,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("clean", help="remove stale worktrees, or a run's branches and records")
     p.add_argument("run", nargs="?", help="run id (or 'last') to remove completely")
     p.add_argument("--all", action="store_true", help="remove every run that is not running")
+    p.add_argument("--force", action="store_true",
+                   help="with RUN or --all: also remove runs that look alive (warns on stderr)")
     p.set_defaults(func=cmd_clean)
 
     p = sub.add_parser("doctor", help="check the environment")

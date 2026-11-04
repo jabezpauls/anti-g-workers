@@ -273,7 +273,7 @@ def test_show_unknown_task_and_misuse(ran, capsys) -> None:
 def test_apply_edit_task(ran, capsys) -> None:
     assert ran.call("apply", "last", "fix") == 0
     out, _ = out_err(capsys)
-    assert out == "applied fix (1 files) to working tree; not committed\n"
+    assert out == "applied fix (1 file) to working tree; not committed\n"
     assert "+    return a + b  # edited" in run_git(["diff"], ran.repo)
     assert run_git(["log", "--oneline"], ran.repo).count("\n") == 1          # nothing committed
     assert ran.call("apply", "last", "fix") == 1                              # already applied: fails
@@ -298,7 +298,7 @@ def test_apply_three_way_message(ran, capsys) -> None:
     run_git(["commit", "-qam", "add header"], ran.repo)
     code = ran.call("apply", "last", "fix")
     out, _ = out_err(capsys)
-    assert code == 0 and out in ("applied fix (1 files) to working tree; not committed\n",
+    assert code == 0 and out in ("applied fix (1 file) to working tree; not committed\n",
                                  "applied fix with 3-way merge; changes are staged; not committed\n")
 
 
@@ -475,6 +475,7 @@ def test_signal_stops_workers_cleans_up_and_prints_summary(cli_env, sig) -> None
     try:
         proc.stdin.write(tasks_json(EDIT, dict(EDIT, id="fix2"), READ, dict(READ, id="look2")))
         proc.stdin.close()
+        proc.stdin = None      # Python 3.11's communicate() flushes a closed stdin
         deadline = time.monotonic() + 30
         while len(cli_env.calls()) < 3 and time.monotonic() < deadline:    # max_parallel is 3
             time.sleep(0.1)
@@ -517,6 +518,7 @@ def test_two_concurrent_agw_processes_on_one_repo(cli_env) -> None:
     for i, proc in enumerate(procs):
         proc.stdin.write(tasks_json(dict(EDIT, id=f"a{i}"), dict(EDIT, id=f"b{i}")))
         proc.stdin.close()
+        proc.stdin = None      # Python 3.11's communicate() flushes a closed stdin
     outs = [proc.communicate(timeout=120) for proc in procs]
     run_ids = set()
     for proc, (out, err) in zip(procs, outs):
@@ -539,6 +541,7 @@ def test_sigkilled_run_is_abandoned_and_cleaned_up_later(cli_env, capsys) -> Non
                             stderr=subprocess.PIPE, text=True, cwd=cli_env.repo)
     proc.stdin.write(tasks_json(EDIT))
     proc.stdin.close()
+    proc.stdin = None      # Python 3.11's communicate() flushes a closed stdin
     deadline = time.monotonic() + 30
     while not cli_env.calls() and time.monotonic() < deadline:
         time.sleep(0.1)
@@ -557,3 +560,70 @@ def test_sigkilled_run_is_abandoned_and_cleaned_up_later(cli_env, capsys) -> Non
         time.sleep(0.2)
     assert cli_env.call("clean", "--all") == 0
     assert list_branches(repo) == []
+
+
+# ---- review fixes ---------------------------------------------------------------------------------------------------
+
+@posix_only
+def test_show_log_includes_setup_and_agy_stderr(cli_env, capsys) -> None:
+    cli_env.write_config(setup=["echo setup-ran"])
+    cli_env.set_scenarios(default={**EDIT_OK, "stderr": "warning: model chatter\n"})
+    code, _, _ = do_run(cli_env, capsys, dict(EDIT, accept=["echo accepted"]))
+    assert code == 0
+    assert cli_env.call("show", "last", "fix", "--log") == 0
+    log = out_err(capsys)[0]
+    assert "== setup ==\n$ echo setup-ran\nsetup-ran\n" in log
+    assert "== acceptance ==\n$ echo accepted" in log
+    assert "== agy stderr ==\nwarning: model chatter\n" in log
+    assert log.index("== setup ==") < log.index("== acceptance ==") < log.index("== agy stderr ==")
+
+
+def test_show_log_truncates_long_logs_and_skips_empty_ones(cli_env, capsys) -> None:
+    code, _, _ = do_run(cli_env, capsys, EDIT)
+    assert code == 0
+    task_dir = runner.runs_root(repo_info(str(cli_env.repo))) / os.listdir(
+        runner.runs_root(repo_info(str(cli_env.repo))))[0] / "fix"
+    (task_dir / "agy.stderr.txt").write_text("".join(f"line {i}\n" for i in range(1000)), encoding="utf-8")
+    assert cli_env.call("show", "last", "fix", "--log") == 0
+    log = out_err(capsys)[0]
+    assert log.startswith("== agy stderr ==\n[... 800 earlier lines omitted ...]\n") and "line 999\n" in log
+    assert "== setup ==" not in log and "line 0\n" not in log
+
+
+def test_apply_pluralizes_file_counts(cli_env, capsys) -> None:
+    two = {"actions": [{"write": "app.py", "content": "x = 1\n"}, {"write": "b.py", "content": "y = 2\n"}],
+           "structured_output": REPORT_DONE}
+    cli_env.set_scenarios(tasks={"fix": two})
+    do_run(cli_env, capsys, EDIT)
+    assert cli_env.call("apply", "last", "fix") == 0
+    assert out_err(capsys)[0] == "applied fix (2 files) to working tree; not committed\n"
+
+
+def test_clean_force_flag(ran, capsys) -> None:
+    run_dir = runner.runs_root(repo_info(str(ran.repo))) / ran.run_id
+    data = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    data.update(status="running", pid=os.getpid())
+    (run_dir / "run.json").write_text(json.dumps(data), encoding="utf-8")
+    assert ran.call("clean", ran.run_id) == 2
+    out_err(capsys)
+    assert ran.call("clean", ran.run_id, "--force") == 0
+    out, err = out_err(capsys)
+    assert out.startswith(f"removed run {ran.run_id}") and "--force" in err and not run_dir.exists()
+
+
+def test_doctor_fails_on_an_insecure_worktree_dir(cli_env, capsys) -> None:
+    cli_env.worktree_dir.chmod(0o755)
+    assert cli_env.call("doctor") == 3
+    assert "FAIL worktree_dir: " in out_err(capsys)[0]
+
+
+def test_run_refuses_an_insecure_worktree_dir(cli_env, capsys) -> None:
+    cli_env.worktree_dir.chmod(0o777)
+    code, _, err = do_run(cli_env, capsys, READ)
+    assert code == 2 and "agw: error: worktree_dir is not safe to use" in err
+
+
+def test_bin_agw_is_executable_in_the_working_tree_and_in_git() -> None:
+    assert os.access(REPO_ROOT / "bin" / "agw", os.X_OK)
+    listing = subprocess.run(["git", "ls-files", "-s", "bin/agw"], cwd=REPO_ROOT, capture_output=True, text=True)
+    assert listing.stdout.startswith("100755")

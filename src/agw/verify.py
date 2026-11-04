@@ -13,7 +13,7 @@ import time
 from typing import BinaryIO
 
 from agw.models import (
-    BLOCKED_ACTIONS, COMMAND_TRUNCATE, DELETED_FILES, LARGE_DIFF, LARGE_DIFF_LINES, NO_CHANGES, NO_REPORT,
+    BLOCKED_ACTIONS, COMMAND_TRUNCATE, BRANCH_SWITCHED, DELETED_FILES, LARGE_DIFF, NO_ACCEPT, LARGE_DIFF_LINES, NO_CHANGES, NO_REPORT,
     OUT_OF_SCOPE_WRITE, OVERLAP, PATH_PARAM_KEYS, READ_MODE_CHANGES, READ_TOOLS, REPORT_MISMATCH,
     REPORT_STATUSES, SCOPE_VIOLATION, SUSPICIOUS_COMMAND, TAIL_LINES, AcceptResult, AgyOutcome, DiffStat,
     Flag, Report, Task, TaskResult, ToolCall,
@@ -331,7 +331,8 @@ def _out_of_scope_paths(tool_calls: list[ToolCall], worktree: str, worktree_base
 
 def task_flags(*, task: Task, worktree: str, worktree_base: str, temp_root: str, brain_dir: str,
                changes: list[str], tool_calls: list[ToolCall], report: Report,
-               diff: DiffStat | None, worker_ran_ok: bool) -> list[Flag]:
+               diff: DiffStat | None, worker_ran_ok: bool, accept_count: int | None = None,
+               branch_switched: str = "") -> list[Flag]:
     """All task-level flags (spec section 9), in the documented order."""
     flags: list[Flag] = []
     edit = task.mode == "edit"
@@ -345,6 +346,9 @@ def task_flags(*, task: Task, worktree: str, worktree_base: str, temp_root: str,
                           and is_suspicious_command(command_line(c), worktree, temp_root)])
     if suspicious:
         flags.append(Flag(SUSPICIOUS_COMMAND, _capped(suspicious, MAX_SUSPICIOUS_COMMANDS)))
+
+    if branch_switched:
+        flags.append(Flag(BRANCH_SWITCHED, branch_switched))
 
     if not edit and changes:
         flags.append(Flag(READ_MODE_CHANGES, _capped(changes, MAX_DETAIL_PATHS)))
@@ -369,6 +373,9 @@ def task_flags(*, task: Task, worktree: str, worktree_base: str, temp_root: str,
 
     if edit and worker_ran_ok and not changes and report.status != "blocked":
         flags.append(Flag(NO_CHANGES, "edit task produced no changes"))
+
+    if edit and changes and accept_count == 0:
+        flags.append(Flag(NO_ACCEPT, "edit not verified by any acceptance command; review the diff"))
 
     if diff is not None and diff.insertions + diff.deletions > LARGE_DIFF_LINES:
         flags.append(Flag(LARGE_DIFF, f"{diff.insertions + diff.deletions} lines changed"))

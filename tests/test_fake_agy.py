@@ -153,6 +153,7 @@ def test_sigterm_emits_interrupted_result(work, tmp_path):
                             text=True, encoding="utf-8")
     proc.stdin.write("Task ID: abc\n")
     proc.stdin.close()
+    proc.stdin = None      # Python 3.11's communicate() flushes a closed stdin
     first = proc.stdout.readline()          # the init event proves the SIGTERM handler is installed
     assert json.loads(first)["event"] == "init"
     time.sleep(0.3)

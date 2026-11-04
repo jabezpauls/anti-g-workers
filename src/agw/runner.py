@@ -10,6 +10,7 @@ import pathlib
 import re
 import secrets
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -21,10 +22,11 @@ from typing import Any
 
 from agw.agy import build_argv, build_settings, parse_stream, run_agy
 from agw.brief import effective_accept, render_brief
-from agw.gitops import (GitError, RepoInfo, add_worktree, commit_all, delete_branch, diff_snapshots, diffstat,
-                        dirty_paths, git, list_branches, prune_worktrees, remove_worktree, resolve_base,
+from agw.config import worktree_dir_problem
+from agw.gitops import (GitError, RepoInfo, add_worktree, checkout_paths, commit_all, delete_branch, diff_snapshots,
+                        diffstat, dirty_paths, git, list_branches, prune_worktrees, remove_worktree, resolve_base,
                         snapshot_tree, worktree_changes, write_patch)
-from agw.models import (DENY_RULE_DROPPED, DIRTY_BASE, EXIT_ENV, EXIT_INTERRUPTED, EXIT_OK, EXIT_TASKS_FAILED,
+from agw.models import (BRANCH_SWITCHED, AgyOutcome, DENY_RULE_DROPPED, DIRTY_BASE, EXIT_ENV, EXIT_INTERRUPTED, EXIT_OK, EXIT_TASKS_FAILED,
                         EXIT_USAGE, KILL_GRACE_SECONDS, MAIN_TREE_CHANGED, MAX_RUNS_LISTED, MAX_TRANSIENT_RETRIES,
                         REPORT_SCHEMA, SNAPSHOT_BASE_LABEL, STALE_RUN_HOURS_WINDOWS, TRANSIENT_RETRY_DELAY_SECONDS,
                         AcceptResult, Config, DiffStat, Flag, RunResult, Task, TaskResult, TaskSet,
@@ -180,8 +182,33 @@ def load_run(repo: RepoInfo, run_id: str) -> dict:
     return _read_json(runs_root(repo) / run_id / "run.json") or {}
 
 
+def process_start_time(pid: int) -> str | None:
+    """An opaque start-time token for a process, or None when it cannot be read.
+
+    Linux: field 22 of /proc/<pid>/stat. macOS: `ps -o lstart= -p <pid>`. A recycled pid has a different token.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        # The command name (field 2) may contain spaces and parentheses; everything after the last ')' is fixed.
+        fields = text[text.rindex(")") + 2:].split()
+        return fields[19] if len(fields) > 19 else None
+    except (OSError, ValueError):
+        pass
+    if sys.platform == "darwin":
+        try:
+            proc = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                                  timeout=10, env={**os.environ, "LC_ALL": "C"})
+        except (OSError, subprocess.SubprocessError):
+            return None
+        text = " ".join(proc.stdout.split())
+        return text if proc.returncode == 0 and text else None
+    return None
+
+
 def is_run_alive(run_json: dict) -> bool:
-    """True if the run claims to be running and its process still exists (Windows: started < 24 h ago)."""
+    """True if the run claims to be running and its process still exists with the recorded start time
+    (Windows: started < 24 h ago). A recorded start time that differs means the pid was reused."""
     if run_json.get("status") != "running":
         return False
     if os.name == "posix":
@@ -196,6 +223,11 @@ def is_run_alive(run_json: dict) -> bool:
             return True            # the process exists but belongs to someone else
         except OSError:
             return False
+        recorded = run_json.get("pid_start")
+        if isinstance(recorded, str) and recorded:
+            current = process_start_time(pid)
+            if current is not None and current != recorded:
+                return False
         return True
     try:
         started = datetime.datetime.fromisoformat(str(run_json.get("started")))
@@ -244,17 +276,38 @@ def _is_fresh(path: str | os.PathLike[str]) -> bool:
 
 
 def _remove_worktree_root(repo: RepoInfo, root: str) -> None:
-    """Remove a run's worktree directory (every task worktree, git's records of them, then the directory)."""
+    """Remove a run's worktree directory (every task worktree, git's records of them, then the directory).
+
+    Only a real directory (checked with lstat, never a symlink) of agw's own layout, <worktree_dir>/<repo slug>/<run>,
+    is removed; a symlink is merely unlinked."""
+    if os.path.islink(root):
+        try:
+            os.unlink(root)
+        except OSError:
+            pass
+        return
+    if not os.path.isdir(root):
+        return
     real = os.path.realpath(root)
     if path_within(repo.main_root, real) or path_within(repo.common_dir, real):
         return                      # never delete the repository or one of its ancestors
+    if os.path.basename(os.path.dirname(real)) != repo_slug(repo.main_root):
+        return                      # not below <worktree_dir>/<slug>: not ours to delete
     try:
         children = os.listdir(real)
     except OSError:
         children = []
     for child in children:
-        remove_worktree(repo, os.path.join(real, child))
+        remove_worktree(repo, os.path.join(real, child), root=real)
     shutil.rmtree(real, ignore_errors=True)
+
+
+def _rmdir_slug_dir(repo: RepoInfo, config: Config) -> None:
+    """Drop <worktree_dir>/<slug>/ once it is empty (never recursively)."""
+    try:
+        os.rmdir(os.path.join(config.worktree_dir, repo_slug(repo.main_root)))
+    except OSError:
+        pass
 
 
 def _worktree_roots(repo: RepoInfo, config: Config) -> dict[str, str]:
@@ -322,14 +375,33 @@ def _delete_run_branches(repo: RepoInfo, run_id: str, rmtree_dir: pathlib.Path |
     return len([b for b in branches if b not in remaining])
 
 
-def clean(repo: RepoInfo, config: Config, run_id: str | None = None, all_runs: bool = False) -> str:
-    """`agw clean` (spec section 5). Raises ValueError(message) for a run that is alive, KeyError for an unknown run."""
+def _warn_forced(run_id: str, data: dict) -> None:
+    pid = data.get("pid")
+    sys.stderr.write(f"agw: warning: --force: removing run {run_id} although it looks alive"
+                     + (f" (pid {pid})" if pid else "") + "\n")
+    sys.stderr.flush()
+
+
+def clean(repo: RepoInfo, config: Config, run_id: str | None = None, all_runs: bool = False, *,
+          force: bool = False, tidy: bool = True) -> str:
+    """`agw clean` (spec section 5). Raises ValueError(message) for a run that is alive (unless `force`), KeyError
+    for an unknown run. `tidy` also removes the then-empty <worktree_dir>/<slug>/ directory."""
+    try:
+        return _clean(repo, config, run_id, all_runs, force)
+    finally:
+        if tidy:
+            _rmdir_slug_dir(repo, config)
+
+
+def _clean(repo: RepoInfo, config: Config, run_id: str | None, all_runs: bool, force: bool) -> str:
     if run_id is not None:
         real = resolve_run_id(repo, run_id)
         _data, alive = _run_state(runs_root(repo) / real)
         if alive:
-            pid = _data.get("pid")
-            raise ValueError(f"run {real} is still running" + (f" (pid {pid})" if pid else ""))
+            if not force:
+                pid = _data.get("pid")
+                raise ValueError(f"run {real} is still running" + (f" (pid {pid})" if pid else ""))
+            _warn_forced(real, _data)
         branches = _remove_run(repo, config, real)
         return f"removed run {real}: {branches} branch(es)"
     if not all_runs:
@@ -340,7 +412,9 @@ def clean(repo: RepoInfo, config: Config, run_id: str | None = None, all_runs: b
     for name in _run_names(repo):
         _data, alive = _run_state(runs_root(repo) / name)
         if alive:
-            continue
+            if not force:
+                continue
+            _warn_forced(name, _data)
         branches += _remove_run(repo, config, name)
         runs += 1
     # Branches whose run record is already gone (for example after a manual `rm -r`) are leftovers too.
@@ -416,27 +490,53 @@ def _commit_message(ctx: RunContext, task: Task) -> str:
     return f"agw {ctx.run_id}/{task.id}: {subject}"
 
 
+def _task_tip(ctx: RunContext, branch: str) -> str:
+    proc = git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}"], ctx.repo.main_root, check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
 def _collect_edit_changes(ctx: RunContext, task: Task, res: TaskResult, wt: str, branch: str,
                           baseline: set[str]) -> list[str]:
-    """Commit the worker's changes on the task branch and write diff.patch. Returns the changed paths."""
-    head = commit_all(wt, _commit_message(ctx, task), baseline)
+    """Commit the worker's changes on the task branch and write diff.patch. Returns the changed paths.
+
+    Only refs/heads/<branch> moves: whatever branch the worker may have switched the worktree to is left alone,
+    and the diff is always base..<task ref>, never base..HEAD."""
+    ref = f"refs/heads/{branch}"
+    head = commit_all(wt, _commit_message(ctx, task), baseline, ref=ref)
     if head is None:
-        # The worker may have committed by itself despite the brief; do not lose that work.
-        current = git(["rev-parse", "HEAD"], wt).stdout.strip()
-        if current != ctx.base_sha:
+        # The worker may have committed on the task branch by itself despite the brief; do not lose that work.
+        current = _task_tip(ctx, branch)
+        if current and current != ctx.base_sha:
             head = current
     diff = diffstat(ctx.repo.main_root, ctx.base_sha, head) if head else DiffStat()
     if head and diff.files:
-        tip = git(["rev-parse", "--verify", "-q", f"refs/heads/{branch}"], ctx.repo.main_root, check=False)
-        if tip.stdout.strip() != head:      # for example the worker switched branches before committing
-            git(["update-ref", f"refs/heads/{branch}", head], ctx.repo.main_root)
         write_patch(ctx.repo.main_root, ctx.base_sha, head, str(pathlib.Path(res.task_dir) / "diff.patch"))
         res.branch, res.head_sha, res.diff = branch, head, diff
         return [path for _letter, path in diff.files]
     if head:                    # committed, but the net change is empty: reset the branch so run_task drops it
-        git(["update-ref", f"refs/heads/{branch}", ctx.base_sha], ctx.repo.main_root)
+        git(["update-ref", ref, ctx.base_sha], ctx.repo.main_root)
     res.branch, res.head_sha, res.diff = "", "", DiffStat()      # run_task deletes the untouched branch afterwards
     return []
+
+
+def _branch_switch(wt: str, branch: str) -> str:
+    """"" while the worktree's HEAD is still the task branch, else a description of where HEAD points now."""
+    sym = git(["symbolic-ref", "-q", "HEAD"], wt, check=False)
+    current = sym.stdout.strip() if sym.returncode == 0 else ""
+    if current == f"refs/heads/{branch}":
+        return ""
+    if current:
+        return f"worker left HEAD on {current[len('refs/heads/'):] if current.startswith('refs/heads/') else current}"
+    sha = git(["rev-parse", "--short", "HEAD"], wt, check=False).stdout.strip()
+    return f"worker left HEAD detached at {sha or 'unknown'}"
+
+
+def _merge_usage(parts: list[dict[str, int]]) -> dict[str, int]:
+    merged: dict[str, int] = {}
+    for usage in parts:
+        for key, value in usage.items():
+            merged[key] = merged.get(key, 0) + value if isinstance(value, int) else merged.get(key, value)
+    return merged
 
 
 def _execute(ctx: RunContext, task: Task, res: TaskResult, scratch: _Scratch, wt: str,
@@ -490,6 +590,7 @@ def _execute(ctx: RunContext, task: Task, res: TaskResult, scratch: _Scratch, wt
     events_path, stderr_path = str(task_dir / "events.ndjson"), str(task_dir / "agy.stderr.txt")
 
     retries = 0
+    earlier: list[AgyOutcome] = []        # failed attempts that were retried: their evidence still counts
     res.worker_ran = True
     while True:
         exit_code, hard_killed, cancelled = run_agy(
@@ -498,13 +599,20 @@ def _execute(ctx: RunContext, task: Task, res: TaskResult, scratch: _Scratch, wt
         if (outcome.retryable and outcome.kind not in ("ok", "timeout", "auth", "interrupted")
                 and retries < MAX_TRANSIENT_RETRIES):
             retries += 1
+            earlier.append(outcome)
+            for path, keep in ((events_path, f"events.{retries}.ndjson"), (stderr_path, f"agy.stderr.{retries}.txt")):
+                try:
+                    os.replace(path, str(task_dir / keep))
+                except OSError:
+                    pass
             if ctx.cancel.wait(ctx.retry_delay):
                 outcome.kind, outcome.error = "interrupted", "interrupted"
                 break
             continue
         break
-    res.usage = dict(outcome.usage)
-    res.commands = [c for c in outcome.tool_calls if c.name == "run_command"]
+    all_calls = [c for o in earlier for c in o.tool_calls] + list(outcome.tool_calls)
+    res.usage = _merge_usage([o.usage for o in earlier] + [outcome.usage])
+    res.commands = [c for c in all_calls if c.name == "run_command"]
 
     if outcome.kind in ("quota", "auth"):
         with ctx.lock:
@@ -515,6 +623,7 @@ def _execute(ctx: RunContext, task: Task, res: TaskResult, scratch: _Scratch, wt
     report = normalize_report(outcome.structured, outcome.response)
     res.report = report
 
+    switched = _branch_switch(wt, branch) if edit else ""
     changes: list[str]
     if edit:
         changes = _collect_edit_changes(ctx, task, res, wt, branch, baseline)
@@ -530,8 +639,8 @@ def _execute(ctx: RunContext, task: Task, res: TaskResult, scratch: _Scratch, wt
 
     res.flags = task_flags(
         task=task, worktree=wt, worktree_base=cfg.worktree_dir, temp_root=ctx.temp_root, brain_dir=ctx.brain_dir,
-        changes=changes, tool_calls=outcome.tool_calls, report=report, diff=res.diff,
-        worker_ran_ok=outcome.kind == "ok")
+        changes=changes, tool_calls=all_calls, report=report, diff=res.diff,
+        worker_ran_ok=outcome.kind == "ok", accept_count=len(accept), branch_switched=switched)
 
     status, why = decide_status(
         mode=task.mode, not_started_reason="", setup_failure="", outcome=outcome, timeout_seconds=timeout,
@@ -567,7 +676,7 @@ def run_task(ctx: RunContext, task: Task) -> TaskResult:
         # The worktree must go first: git refuses to delete a branch that is checked out.
         if scratch.worktree_added or os.path.lexists(wt):
             try:
-                remove_worktree(ctx.repo, wt)
+                remove_worktree(ctx.repo, wt, root=ctx.worktree_root)
             except Exception:  # noqa: BLE001 - execute_run sweeps the whole worktree root again at the end
                 pass
         if branch and not res.branch:          # an edit task that kept no result must not leave a branch behind
@@ -604,8 +713,11 @@ def execute_run(taskset: TaskSet, config: Config, repo: RepoInfo, *, model_overr
     if cancel is None:
         cancel = threading.Event()
     t0 = time.monotonic()
+    problem = worktree_dir_problem(config.worktree_dir, create=True)
+    if problem:
+        raise RunError(f"worktree_dir is not safe to use: {problem}", EXIT_USAGE)
     try:
-        clean(repo, config)
+        clean(repo, config, tidy=False)
     except Exception:  # noqa: BLE001 - stale cleanup is best effort and must never block a run
         pass
 
@@ -640,6 +752,9 @@ def execute_run(taskset: TaskSet, config: Config, repo: RepoInfo, *, model_overr
     started = datetime.datetime.now().isoformat(timespec="seconds")
     run_json: dict[str, Any] = {"run_id": run_id, "pid": os.getpid(), "status": "running", "started": started,
                                 "worktree_root": worktree_root}
+    start_token = process_start_time(os.getpid())
+    if start_token:
+        run_json["pid_start"] = start_token
     results: list[TaskResult] = []
     try:
         _write_json(run_dir / "tasks.json", to_jsonable(taskset))
@@ -650,8 +765,11 @@ def execute_run(taskset: TaskSet, config: Config, repo: RepoInfo, *, model_overr
         dirty = dirty_paths(before)
         if dirty and base_ref != SNAPSHOT_BASE_LABEL:
             flags.append(Flag(DIRTY_BASE, f"{len(dirty)} uncommitted path(s) not visible to workers"))
+        # Every checkout of this repository, not only the one agw runs from: the primary checkout when agw runs from a
+        # linked worktree, and the user's other linked worktrees. agw's own worktrees are excluded.
         deny_base = [repo.main_root]
-        if not path_within(repo.common_dir, repo.main_root):
+        deny_base.extend(p for p in checkout_paths(repo) if not path_within(p, config.worktree_dir))
+        if not any(path_within(repo.common_dir, p) for p in deny_base):
             deny_base.append(repo.common_dir)
         deny_base.extend(config.deny_write)
         kept: list[str] = []
@@ -693,7 +811,7 @@ def execute_run(taskset: TaskSet, config: Config, repo: RepoInfo, *, model_overr
             run_id=run_id, base_sha=base_sha, base_ref=base_ref, main_root=repo.main_root, started=started,
             duration_seconds=time.monotonic() - t0, tasks=results, flags=flags,
             exit_code=_exit_code(results, flags, cancel), status="interrupted" if interrupted else "done",
-            pid=os.getpid(), retry_limit=config.retry_limit)
+            pid=os.getpid(), pid_start=start_token or "", retry_limit=config.retry_limit)
         _write_text(run_dir / "summary.txt", render_summary(result))
         _write_json(run_dir / "run.json", to_jsonable(result))
         return result
