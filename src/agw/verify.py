@@ -8,6 +8,7 @@ import shlex
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from typing import BinaryIO
 
@@ -53,15 +54,39 @@ def _kill_tree(proc: "subprocess.Popen[bytes]") -> None:
             pass
 
 
+def _wait_for_exit(proc: "subprocess.Popen[bytes]", timeout_seconds: float,
+                   cancel: threading.Event | None) -> str:
+    """Wait for proc. Returns "exit", "timeout" or "cancel" (the last only when `cancel` gets set)."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "timeout"
+        try:
+            proc.wait(timeout=min(0.2, remaining))
+            return "exit"
+        except subprocess.TimeoutExpired:
+            pass
+        if cancel is not None and cancel.is_set():
+            return "cancel"
+
+
 def run_acceptance(commands: list[str], cwd: str, timeout_seconds: int, log_path: str,
-                   env: dict[str, str]) -> list[AcceptResult]:
-    """Run every acceptance command in order (shell, in cwd). Output is capped; timeouts give exit -1."""
+                   env: dict[str, str], cancel: threading.Event | None = None) -> list[AcceptResult]:
+    """Run every acceptance command in order (shell, in cwd). Output is capped; timeouts give exit -1.
+
+    If `cancel` is set, the running command's process group is killed (exit -1, tail ends with "(interrupted)")
+    and the remaining commands are not started.
+    """
     results: list[AcceptResult] = []
     if not commands:
         return results
     os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
     with open(log_path, "w", encoding="utf-8") as log:
         for command in commands:
+            if cancel is not None and cancel.is_set():
+                break
+            interrupted = False
             started = time.monotonic()
             exit_code = 0
             with tempfile.TemporaryFile() as out:
@@ -74,20 +99,21 @@ def run_acceptance(commands: list[str], cwd: str, timeout_seconds: int, log_path
                     output = f"agw: cannot start command: {exc}"
                     exit_code = 127
                 else:
-                    try:
-                        exit_code = proc.wait(timeout=timeout_seconds)
+                    waited = _wait_for_exit(proc, timeout_seconds, cancel)
+                    if waited == "exit":
+                        exit_code = proc.returncode
                         output = _read_capped(out)
-                    except subprocess.TimeoutExpired:
+                        if os.name != "nt":
+                            _kill_tree_group_leftovers(proc)
+                    else:
                         _kill_tree(proc)
                         proc.wait()
                         output = _read_capped(out)
                         if output and not output.endswith("\n"):
                             output += "\n"
-                        output += f"(timed out after {timeout_seconds}s)"
+                        interrupted = waited == "cancel"
+                        output += "(interrupted)" if interrupted else f"(timed out after {timeout_seconds}s)"
                         exit_code = -1
-                    else:
-                        if os.name != "nt":
-                            _kill_tree_group_leftovers(proc)
             duration = time.monotonic() - started
             log.write(f"$ {command}\n{output}")
             if output and not output.endswith("\n"):
@@ -97,6 +123,8 @@ def run_acceptance(commands: list[str], cwd: str, timeout_seconds: int, log_path
             tail = output.rstrip("\n").splitlines()[-TAIL_LINES:]
             results.append(AcceptResult(command=command, exit_code=exit_code, tail=tail,
                                         duration_seconds=duration))
+            if interrupted:
+                break
     return results
 
 

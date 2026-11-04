@@ -480,3 +480,29 @@ def test_status_precedence() -> None:
     assert _decide(report=Report("partial", "s"), accept=[AcceptResult("a", 1)]) == ("failed", "acceptance failed")
     assert _decide(not_started_reason="auth failure", setup_failure="x", outcome=timeout)[0] == "skipped"
     assert _decide(setup_failure="x", outcome=timeout)[0] == "error"
+
+
+# ---- run_acceptance cancellation (added in T7 so Ctrl-C does not wait for a long command) --------------
+
+@posix_only
+def test_run_acceptance_cancel_stops_running_command_and_skips_the_rest(tmp_path) -> None:
+    import threading
+    import time
+    cancel = threading.Event()
+    threading.Timer(0.5, cancel.set).start()
+    log = tmp_path / "accept.log"
+    t0 = time.monotonic()
+    results = run_acceptance(["echo before; sleep 30 & sleep 30", "echo never"], str(tmp_path), 60, str(log),
+                             dict(os.environ), cancel=cancel)
+    assert time.monotonic() - t0 < 10
+    assert [r.exit_code for r in results] == [-1]          # the second command never started
+    assert results[0].tail[-1] == "(interrupted)"
+    assert "(interrupted)" in log.read_text(encoding="utf-8")
+
+
+@posix_only
+def test_run_acceptance_already_cancelled_runs_nothing(tmp_path) -> None:
+    import threading
+    cancel = threading.Event()
+    cancel.set()
+    assert run_acceptance(["echo hi"], str(tmp_path), 30, str(tmp_path / "l"), dict(os.environ), cancel=cancel) == []
