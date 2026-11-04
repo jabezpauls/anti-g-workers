@@ -486,7 +486,7 @@ next: agw show 20261105-143201-a1b2 <task> [--diff|--log|--events]; agw apply 20
 | `BLOCKED_ACTIONS` | warn | task | `report.blocked_actions` non-empty | `<n> action(s)` |
 | `NO_REPORT` | warn | task | `report.status == "missing"` and the worker ran OK | `worker returned no structured report` |
 | `REPORT_MISMATCH` | warn | task | edit mode, `report.status == "done"`, and some normalized `files_changed` entry is not in the actual changed set | `claimed but unchanged: <paths, up to 5>` |
-| `BRANCH_SWITCHED` | warn | task | the worker switched branches in its worktree (its HEAD is no longer the task's branch, or the detached base for read tasks) | `worker switched branches; review the diff` |
+| `BRANCH_SWITCHED` | warn | task | edit mode: the worker switched branches in its worktree (its HEAD is no longer the task's branch) | `worker left HEAD on <branch>` or `worker left HEAD detached at <sha>` |
 | `NO_ACCEPT` | info | task | edit mode, worker ran OK, and the effective acceptance list is empty | `edit not verified by any acceptance command; review the diff` |
 | `NO_CHANGES` | info | task | edit mode, worker ran OK, no changes, `report.status != "blocked"` | `edit task produced no changes` |
 | `LARGE_DIFF` | info | task | insertions + deletions > 400 | `<n> lines changed` |
