@@ -112,7 +112,7 @@ The plugin puts `agw` on the Bash tool's PATH while it is enabled. You can also 
 | `agw show [RUN [TASK] [--diff\|--log\|--brief\|--events\|--report]]` | with no arguments, list the 20 newest runs; with `RUN`, print its summary; with `RUN TASK`, print full task detail or one of the artifacts |
 | `agw apply RUN TASK` | apply an edit task's patch to the working tree without committing |
 | `agw clean [RUN] [--all]` | with no arguments, mark dead runs abandoned and remove stale worktrees; with `RUN` or `--all`, also remove the run's branches and records |
-| `agw doctor [--live]` | check python, git, agy, config, repo and worktree dir; `--live` also makes one real agy call |
+| `agw doctor [--live]` | check python, git, agy, config, repo, worktree dir and the write-deny guardrail; `--live` also makes one real agy call. Exit 0 unless a check FAILs (then 3) |
 | `agw config` | print the effective config with the source of each value |
 
 `RUN` may be the literal `last`, meaning the newest run in this repository. `agw run` must be started from inside the git repository.

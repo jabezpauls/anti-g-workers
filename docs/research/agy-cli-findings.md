@@ -97,9 +97,12 @@ Everything here was observed, not assumed. Anything still unknown is marked UNVE
 - The same `write_file(<dir>)` deny rule also blocked **`edit_file`** of an existing file under `<dir>`
   (`worktree-structured-output.ndjson`). So `write_file(...)` covers edits.
 - Matching is by **path component**, not raw string prefix: denying `…/main` did NOT block `…/main2/z.txt`.
-- **A denied tool call emits NO `step_update` event at all.** The step index just skips (step 2 is missing in
-  `deny-rule-write.ndjson`). The only trace is the model's own text or structured report, so the report schema needs a
-  `blocked_actions` field.
+- **A denied tool call emits an ACTIVE event followed by an ERROR event** (CORRECTED in round 3; round 2 wrongly
+  said "no `step_update` at all"). In `deny-rule-write.ndjson` step 2 is `write_file` ACTIVE, then `write_file` ERROR
+  with `tool_info.error = {"type":"TOOL_ERROR","message":"permission check failed for write_file \"<path>\":
+  Permission denied for write_file(<path>). Matches user-configured deny rule."}`. The same holds for a denied
+  `edit_file` (`worktree-structured-output.ndjson`, step 6). Re-verified live on agy 1.5.0 (see round 3). Consumers
+  must ignore tool steps whose latest state is ERROR; the model's own `blocked_actions` report is the second signal.
 - **Deny beats allow.** `deny:["write_file(/)"]` plus `allow:["write_file(<repo>)"]` blocked writes inside `<repo>` too.
 - `allow` rules WITHOUT `--dangerously-skip-permissions` do NOT confine writes: `allow:["write_file(<repo>)", …]`
   (no skip flag) still let `write_file` create a file outside `<repo>`.
@@ -162,3 +165,23 @@ turn, so the brief should still say "never ask questions".
 - agy keeps per-conversation state under `~/.gemini/antigravity-cli/` (`brain/<conversation-id>/`, `conversations/`).
 - Usage per tiny run: ~7–9k input tokens per model turn (system prompt overhead). Even trivial workers cost ~15–50k
   input tokens.
+
+---
+
+## Round 3: final verification, `agy` 1.5.0 (`agy --version` = 1.5.0), Linux, 2026-11-05
+
+Observed through `agw` in throwaway git repos under a scratch dir in `/tmp`, model `gemini-3.8-flash-low`.
+
+- **Denied file-tool writes (re-verified).** An edit worker told to write four files with its file tool: the write into
+  the main repo root (covered by `write_file(<main root>)`) produced `ACTIVE` then `ERROR` in `events.ndjson`, while
+  writes to the worktree, to another scratch dir and to `/var/tmp` succeeded. A read worker, whose own worktree is
+  also denied, got `ACTIVE`+`ERROR` for both `edit_file` and `write_file`; the worktree stayed unchanged.
+- **The structured report arrives as a `finish` tool step.** The final `step_update` events have `tool_name:"finish"`
+  with the report fields (`status`, `summary`, `blocked_actions`, ...) as `tool_info.parameters`, in addition to the
+  `structured_output` in the `result` event. A worker that was denied listed the denied path in `blocked_actions`.
+- **Deny rules do not cover the shell.** A read worker's `run_command` `echo hi > newfile.txt` (inside its worktree)
+  and `echo leak > <main repo>/shell_leak.txt` both exited 0 and wrote the files. Only the main-tree snapshot catches
+  the second one.
+- **SIGINT to agw**: both agy processes were terminated, the shell child `sleep 100` did not survive, agw exited 130
+  within about 0.5 s and the summary was printed (`error: interrupted: interrupted`).
+- **Token use** of tiny workers on `gemini-3.8-flash-low`: 16k-62k input tokens per run, 0-1k output.
