@@ -2,16 +2,22 @@
 from __future__ import annotations
 
 import dataclasses
+import fnmatch
 import os
+import re
 import shutil
+import stat
 import subprocess
 import threading
 import time
 
-from agw.models import SNAPSHOT_BASE_LABEL, DiffStat
+from agw.models import CACHE_EXCLUDES, SNAPSHOT_BASE_LABEL, DiffStat
 
 HEAD_KEY = "__HEAD__"
 _LOCK_RETRIES = 5
+# Only git's own "another process holds the lock" message is worth retrying; a file name such as yarn.lock in an
+# error message is not.
+_LOCK_MESSAGE = re.compile(r"Unable to create '[^']*\.lock'")
 _WORKTREE_LOCK = threading.Lock()
 # Repo-selecting variables inherited from a parent git process (for example when agw is started from a git
 # hook) would silently redirect every command to the wrong repository. agw always selects the repo by cwd.
@@ -72,7 +78,7 @@ def _run(args: list[str], cwd: str, input_data: str | bytes | None, env: dict[st
         if proc.returncode == 0:
             return proc
         stderr = proc.stderr if isinstance(proc.stderr, str) else proc.stderr.decode("utf-8", "replace")
-        if ".lock" not in stderr or attempt == _LOCK_RETRIES:
+        if (args[:1] == ["apply"] or not _LOCK_MESSAGE.search(stderr)) or attempt == _LOCK_RETRIES:
             return proc
         time.sleep(0.2 * 2 ** attempt)
     assert proc is not None
@@ -113,8 +119,10 @@ def resolve_base(repo: RepoInfo, ref: str, snapshot_dirty: bool) -> tuple[str, s
         # `git stash create` writes a commit object without touching the work tree, index or refs. It needs
         # a committer identity, which the user may not have configured.
         proc = git([*_AGW_IDENTITY_ARGS, "stash", "create"], repo.main_root, check=False, env=_AGW_IDENTITY)
+        if proc.returncode != 0:
+            raise GitError(["stash", "create"], proc.returncode, proc.stderr or "")
         sha = proc.stdout.strip()
-        if proc.returncode == 0 and sha:
+        if sha:
             return sha, SNAPSHOT_BASE_LABEL
     if ref.startswith("-"):
         raise GitError(["rev-parse", "--verify", ref], 128, f"invalid ref {ref!r}")
@@ -216,41 +224,102 @@ def _safe_to_delete(repo: RepoInfo, path: str) -> bool:
     return real != os.path.dirname(real)     # filesystem root
 
 
-def remove_worktree(repo: RepoInfo, path: str) -> None:
-    """Remove a worktree directory and its git registration. Safe to call repeatedly or on a missing path."""
-    git(["worktree", "remove", "--force", path], repo.main_root, check=False)
-    if _safe_to_delete(repo, path):
-        if os.path.islink(path):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-        else:
-            shutil.rmtree(path, ignore_errors=True)
+def _is_real_dir(path: str) -> bool:
+    """True for an existing directory that is not a symlink (checked with lstat, never following links)."""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _under(path: str, root: str) -> bool:
+    """True if realpath(path) is strictly below realpath(root)."""
+    real, base = os.path.realpath(path), os.path.realpath(root)
+    return real != base and real.startswith(base.rstrip(os.sep) + os.sep)
+
+
+def remove_worktree(repo: RepoInfo, path: str, root: str | None = None) -> None:
+    """Remove a worktree directory and its git registration. Safe to call repeatedly or on a missing path.
+
+    Only a real directory (not a symlink) is ever removed recursively, and when `root` is given only one whose
+    realpath lies below it. A symlink is merely unlinked; anything else is left alone.
+    """
+    if path and os.path.islink(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        prune_worktrees(repo)
+        return
+    if path and _is_real_dir(path) and _safe_to_delete(repo, path) and (root is None or _under(path, root)):
+        git(["worktree", "remove", "--force", path], repo.main_root, check=False)
+        shutil.rmtree(path, ignore_errors=True)
     prune_worktrees(repo)
 
 
+def is_cache_path(path: str) -> bool:
+    """True for build/test cache artifacts (CACHE_EXCLUDES) that are never part of a worker's deliverable."""
+    parts = path.replace("\\", "/").split("/")
+    for pattern in CACHE_EXCLUDES:
+        if pattern.endswith("/"):
+            if pattern[:-1] in parts[:-1]:
+                return True
+        elif fnmatch.fnmatchcase(parts[-1], pattern):
+            return True
+    return False
+
+
+def _cache_pathspecs() -> list[str]:
+    specs = []
+    for pattern in CACHE_EXCLUDES:
+        specs.append(f":(exclude,glob)**/{pattern}**" if pattern.endswith("/") else f":(exclude,glob)**/{pattern}")
+    return specs
+
+
+def checkout_paths(repo: RepoInfo) -> list[str]:
+    """Realpaths of every checkout of this repository (`git worktree list --porcelain`), sorted."""
+    proc = git(["worktree", "list", "--porcelain"], repo.main_root, check=False)
+    found = {os.path.realpath(line[len("worktree "):]) for line in proc.stdout.splitlines()
+             if line.startswith("worktree ")}
+    found.add(repo.main_root)
+    return sorted(found)
+
+
 def worktree_changes(wt: str, ignore: set[str]) -> list[str]:
-    """Sorted paths with uncommitted changes in wt (including untracked), minus ignore."""
-    return sorted({path for _xy, path in _status_entries(wt)} - set(ignore))
+    """Sorted paths with uncommitted changes in wt (including untracked), minus ignore and cache artifacts."""
+    return sorted({path for _xy, path in _status_entries(wt) if not is_cache_path(path)} - set(ignore))
 
 
-def commit_all(wt: str, message: str, ignore: set[str]) -> str | None:
-    """Commit every change in wt except the ignored paths. Returns the new HEAD sha, or None if nothing changed."""
-    git(["add", "-A"], wt)
+def commit_all(wt: str, message: str, ignore: set[str], ref: str | None = None) -> str | None:
+    """Commit every change in wt except the ignored paths and cache artifacts, moving only `ref`.
+
+    `ref` is the full ref name (refs/heads/agw/<run>/<task>); by default the branch HEAD is on. The commit is made
+    with plumbing (write-tree, commit-tree, update-ref) so HEAD, and whatever branch the worker may have switched
+    to, never moves. Returns the new commit sha, or None when the tree is unchanged from the ref's tip.
+    """
+    if ref is None:
+        sym = git(["symbolic-ref", "-q", "HEAD"], wt, check=False)
+        ref = sym.stdout.strip() if sym.returncode == 0 and sym.stdout.strip() else "HEAD"
+    git(["add", "-A", "--", ".", *_cache_pathspecs()], wt)
     if ignore:
         staged = git(["diff", "--cached", "--name-only", "-z"], wt).stdout.split("\0")
         to_unstage = sorted(p for p in staged if p in ignore)
         if to_unstage:
             git(["reset", "-q", "--pathspec-from-file=-", "--pathspec-file-nul"], wt,
                 input="\0".join(to_unstage) + "\0", env={"GIT_LITERAL_PATHSPECS": "1"})
-    quiet = git(["diff", "--cached", "--quiet"], wt, check=False)
-    if quiet.returncode == 0:
-        return None
-    if quiet.returncode != 1:
-        raise GitError(["diff", "--cached", "--quiet"], quiet.returncode, quiet.stderr)
-    git([*_AGW_IDENTITY_ARGS, "commit", "-q", "--no-verify", "-m", message], wt, env=_AGW_IDENTITY)
-    return git(["rev-parse", "HEAD"], wt).stdout.strip()
+    tree = git(["write-tree"], wt).stdout.strip()
+    tip_proc = git(["rev-parse", "--verify", "-q", f"{ref}^{{commit}}"], wt, check=False)
+    tip = tip_proc.stdout.strip() if tip_proc.returncode == 0 else ""
+    if tip:
+        tip_tree = git(["rev-parse", f"{tip}^{{tree}}"], wt).stdout.strip()
+        if tip_tree == tree:
+            return None
+    args = ["commit-tree", tree, "-m", message]
+    if tip:
+        args[2:2] = ["-p", tip]
+    new = git(args, wt, env=_AGW_IDENTITY).stdout.strip()
+    git(["update-ref", ref, new, tip or "0" * 40], wt)
+    return new
 
 
 def diffstat(repo_dir: str, base: str, head: str) -> DiffStat:

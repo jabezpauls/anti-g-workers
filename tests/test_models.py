@@ -10,7 +10,7 @@ from agw.models import (AcceptResult, DiffStat, Flag, Report, RunResult, TaskRes
 ALL_FLAG_CODES = {
     m.OUT_OF_SCOPE_WRITE, m.SUSPICIOUS_COMMAND, m.READ_MODE_CHANGES, m.SCOPE_VIOLATION, m.BLOCKED_ACTIONS,
     m.NO_REPORT, m.REPORT_MISMATCH, m.NO_CHANGES, m.LARGE_DIFF, m.DELETED_FILES, m.MAIN_TREE_CHANGED,
-    m.DIRTY_BASE, m.OVERLAP, m.DENY_RULE_DROPPED,
+    m.DIRTY_BASE, m.OVERLAP, m.DENY_RULE_DROPPED, m.BRANCH_SWITCHED, m.NO_ACCEPT,
 }
 
 
@@ -54,7 +54,8 @@ def test_flag_levels():
 def test_flag_sets_are_disjoint_and_complete():
     assert m.WARN_FLAGS.isdisjoint(m.INFO_FLAGS)
     assert m.WARN_FLAGS | m.INFO_FLAGS == ALL_FLAG_CODES
-    assert len(ALL_FLAG_CODES) == 14
+    assert len(ALL_FLAG_CODES) == 16
+    assert m.Flag(m.BRANCH_SWITCHED, "x").level == "warn" and m.Flag(m.NO_ACCEPT, "x").level == "info"
 
 
 def test_task_result_from_dict_ignores_unknown_keys():

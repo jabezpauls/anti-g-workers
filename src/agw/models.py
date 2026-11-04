@@ -33,12 +33,17 @@ MAIN_TREE_CHANGED = "MAIN_TREE_CHANGED"
 DIRTY_BASE = "DIRTY_BASE"
 OVERLAP = "OVERLAP"
 DENY_RULE_DROPPED = "DENY_RULE_DROPPED"
+BRANCH_SWITCHED = "BRANCH_SWITCHED"
+NO_ACCEPT = "NO_ACCEPT"
 
 WARN_FLAGS = frozenset({
     OUT_OF_SCOPE_WRITE, SUSPICIOUS_COMMAND, READ_MODE_CHANGES, SCOPE_VIOLATION, BLOCKED_ACTIONS,
-    NO_REPORT, REPORT_MISMATCH, MAIN_TREE_CHANGED, OVERLAP,
+    NO_REPORT, REPORT_MISMATCH, MAIN_TREE_CHANGED, OVERLAP, BRANCH_SWITCHED,
 })
-INFO_FLAGS = frozenset({NO_CHANGES, LARGE_DIFF, DELETED_FILES, DIRTY_BASE, DENY_RULE_DROPPED})
+INFO_FLAGS = frozenset({NO_CHANGES, LARGE_DIFF, DELETED_FILES, DIRTY_BASE, DENY_RULE_DROPPED, NO_ACCEPT})
+
+# Build/test caches that are never part of a worker's deliverable: not committed, not in patches, not "changes".
+CACHE_EXCLUDES = ["__pycache__/", "*.pyc", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/"]
 
 # ---- tunables (constants, not config) --------------------------------------------------------
 LARGE_DIFF_LINES = 400
@@ -219,6 +224,7 @@ class RunResult:
     exit_code: int = 0
     status: str = "done"                     # "running" | "done" | "interrupted" | "abandoned"
     pid: int = 0
+    pid_start: str = ""                      # process start-time token, guards against pid reuse
     retry_limit: int = 2
 
 

@@ -595,7 +595,7 @@ def test_git_lock_retry_gives_up_after_five_retries(monkeypatch, tmp_path):
 
     def fake_run(cmd, **kwargs):
         calls.append(1)
-        return subprocess.CompletedProcess(cmd, 128, "", "index.lock exists")
+        return subprocess.CompletedProcess(cmd, 128, "", "fatal: Unable to create '.git/index.lock': File exists.")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setattr(gitops.time, "sleep", lambda s: None)
@@ -644,3 +644,137 @@ def test_concurrent_add_worktree(git_repo, tmp_path):
     for i in range(6):
         gitops.remove_worktree(repo, str(tmp_path / "wt" / f"t{i}"))
     assert run_git(["worktree", "list", "--porcelain"], git_repo).count("worktree ") == 1
+
+
+# ---- narrow lock retry ---------------------------------------------------------------------------------
+
+def test_git_does_not_retry_when_a_filename_merely_contains_lock(monkeypatch, tmp_path):
+    calls: list[int] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(1)
+        return subprocess.CompletedProcess(cmd, 1, "", "error: patch failed: yarn.lock:3")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(gitops.time, "sleep", lambda s: None)
+    with pytest.raises(GitError):
+        gitops.git(["status"], str(tmp_path))
+    assert len(calls) == 1
+
+
+def test_git_apply_is_never_retried(monkeypatch, tmp_path):
+    calls: list[int] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(1)
+        return subprocess.CompletedProcess(cmd, 1, "", "fatal: Unable to create '.git/index.lock': File exists.")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(gitops.time, "sleep", lambda s: None)
+    assert gitops.git(["apply", "--check", "p.patch"], str(tmp_path), check=False).returncode == 1
+    assert len(calls) == 1
+
+
+def test_failing_patch_touching_yarn_lock_fails_once(git_repo, tmp_path, monkeypatch):
+    (git_repo / "yarn.lock").write_text("a\nb\nc\n", encoding="utf-8")
+    run_git(["add", "-A"], git_repo)
+    run_git(["commit", "-q", "-m", "lock"], git_repo)
+    patch = tmp_path / "p.patch"
+    patch.write_text("diff --git a/yarn.lock b/yarn.lock\n--- a/yarn.lock\n+++ b/yarn.lock\n@@ -1,3 +1,3 @@\n"
+                     " x\n-y\n+z\n w\n", encoding="utf-8")
+    calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def spy(cmd, **kwargs):
+        calls.append(cmd)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    monkeypatch.setattr(gitops.time, "sleep", lambda s: None)
+    how, _ = gitops.apply_patch(str(git_repo), str(patch))
+    assert how == "conflict"
+    assert [c[1] for c in calls].count("apply") == 2        # --check and --3way, once each: no retries
+
+
+# ---- commit_all moves only the task ref --------------------------------------------------------------
+
+def test_commit_all_with_ref_never_moves_the_checked_out_branch(edit_wt):
+    repo, wt = edit_wt
+    run_git(["branch", "develop", repo.head_sha], wt)
+    run_git(["checkout", "-q", "develop"], wt)
+    (wt / "app.py").write_text("changed\n", encoding="utf-8")
+    sha = gitops.commit_all(str(wt), "m", set(), ref="refs/heads/agw/r/edit")
+    assert sha and run_git(["rev-parse", "agw/r/edit"], wt).strip() == sha
+    assert run_git(["rev-parse", "develop"], wt).strip() == repo.head_sha
+    assert run_git(["rev-parse", "HEAD^{tree}"], wt).strip() != run_git(["rev-parse", sha + "^{tree}"], wt).strip()
+    assert run_git(["log", "-1", "--format=%P", sha], wt).strip() == repo.head_sha
+    # unchanged tree: no second commit
+    assert gitops.commit_all(str(wt), "m", set(), ref="refs/heads/agw/r/edit") is None
+
+
+def test_commit_all_excludes_cache_artifacts(edit_wt):
+    repo, wt = edit_wt
+    (wt / "__pycache__").mkdir()
+    (wt / "__pycache__" / "x.pyc").write_bytes(b"\0\1")
+    (wt / "pkg" / "__pycache__").mkdir(parents=True)
+    (wt / "pkg" / "__pycache__" / "y.cpython.pyc").write_bytes(b"\0")
+    (wt / "stray.pyc").write_bytes(b"\0")
+    (wt / ".pytest_cache").mkdir()
+    (wt / ".pytest_cache" / "v").write_text("1", encoding="utf-8")
+    (wt / "real.py").write_text("1\n", encoding="utf-8")
+    assert gitops.worktree_changes(str(wt), set()) == ["real.py"]
+    gitops.commit_all(str(wt), "m", set())
+    assert run_git(["diff", "--name-only", repo.head_sha, "HEAD"], wt).split() == ["real.py"]
+
+
+def test_cache_excludes_constant():
+    from agw.models import CACHE_EXCLUDES
+    assert CACHE_EXCLUDES == ["__pycache__/", "*.pyc", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/"]
+
+
+# ---- symlink-safe removal ----------------------------------------------------------------------------
+
+def test_remove_worktree_ignores_directory_outside_allowed_root(git_repo, tmp_path):
+    repo = gitops.repo_info(str(git_repo))
+    root = tmp_path / "runroot"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("k", encoding="utf-8")
+    gitops.remove_worktree(repo, str(outside), root=str(root))
+    assert (outside / "keep.txt").is_file()
+
+
+def test_remove_worktree_unlinks_symlink_inside_root(git_repo, tmp_path):
+    repo = gitops.repo_info(str(git_repo))
+    root = tmp_path / "runroot"
+    root.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "keep.txt").write_text("k", encoding="utf-8")
+    (root / "ln").symlink_to(target)
+    gitops.remove_worktree(repo, str(root / "ln"), root=str(root))
+    assert not os.path.lexists(root / "ln") and (target / "keep.txt").is_file()
+
+
+# ---- snapshot_dirty strictness -----------------------------------------------------------------------
+
+def test_snapshot_dirty_stash_failure_raises(git_repo, monkeypatch):
+    repo = gitops.repo_info(str(git_repo))
+    real = gitops.git
+
+    def fake(args, cwd, **kw):
+        if "stash" in args:
+            return subprocess.CompletedProcess(args, 128, "", "fatal: stash exploded")
+        return real(args, cwd, **kw)
+
+    monkeypatch.setattr(gitops, "git", fake)
+    with pytest.raises(GitError, match="stash exploded"):
+        gitops.resolve_base(repo, "HEAD", True)
+
+
+def test_other_worktrees_lists_every_checkout(git_repo, tmp_path):
+    repo = gitops.repo_info(str(git_repo))
+    other = tmp_path / "linked"
+    gitops.add_worktree(repo, str(other), repo.head_sha, "feature")
+    assert gitops.checkout_paths(repo) == sorted({str(git_repo), os.path.realpath(other)})
