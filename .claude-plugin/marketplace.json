@@ -1,0 +1,12 @@
+{
+  "name": "ag-workers",
+  "description": "ag-workers: hand work from Claude Code to Gemini workers through the official agy CLI.",
+  "owner": { "name": "jabezpauls" },
+  "plugins": [
+    {
+      "name": "ag-workers",
+      "source": "./",
+      "description": "Delegate well-specified work to Gemini workers via agy, verify it, and integrate it."
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "ag-workers",
+  "version": "0.1.0",
+  "description": "Delegate well-specified work from Claude Code to cheap Gemini workers via the official Antigravity agy CLI, then verify and integrate it.",
+  "author": { "name": "jabezpauls" },
+  "license": "MIT",
+  "keywords": ["gemini", "antigravity", "agy", "delegation", "workers", "git-worktree"]
+}
