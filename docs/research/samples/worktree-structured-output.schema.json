@@ -1,0 +1,1 @@
+{"type":"object","properties":{"status":{"type":"string","enum":["done","partial","blocked"]},"summary":{"type":"string"},"files_changed":{"type":"array","items":{"type":"string"}},"blocked_actions":{"type":"array","items":{"type":"string"}}},"required":["status","summary","files_changed","blocked_actions"]}
