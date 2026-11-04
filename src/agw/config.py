@@ -5,6 +5,7 @@ import getpass
 import json
 import os
 import pathlib
+import stat
 import tempfile
 import tomllib
 from typing import Any, Callable
@@ -44,7 +45,47 @@ def default_worktree_dir() -> str:
         user = getpass.getuser() or "user"
     except Exception:  # noqa: BLE001 - getuser can raise KeyError/OSError/ImportError on odd systems
         user = "user"
-    return os.path.realpath(os.path.join(tempfile.gettempdir(), f"agw-{user}"))
+    return _real_parent(os.path.join(tempfile.gettempdir(), f"agw-{user}"))
+
+
+def _real_parent(path: str) -> str:
+    """Absolute path with every symlink resolved except a symlink in the last component, which must stay visible
+    so the worktree root check can reject it."""
+    path = os.path.abspath(path)
+    parent, name = os.path.split(path)
+    return os.path.join(os.path.realpath(parent), name) if name else os.path.realpath(path)
+
+
+def worktree_dir_problem(path: str, create: bool = False) -> str:
+    """Why `path` is not safe as agw's worktree root ("" when it is). With `create`, a missing directory is made
+    with mode 0o700. Safe means: a real directory (no symlink), owned by the current user, not accessible to
+    group or others. The owner and mode checks are skipped on Windows."""
+    if create and not os.path.lexists(path):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            os.mkdir(path, 0o700)
+            if os.name == "posix":
+                os.chmod(path, 0o700)          # umask must not leave it looser (or tighter) than 0o700
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            return f"cannot create {path}: {exc.strerror or exc}"
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        return f"cannot inspect {path}: {exc.strerror or exc}"
+    if stat.S_ISLNK(info.st_mode):
+        return f"{path} is a symlink; remove it or choose another worktree_dir"
+    if not stat.S_ISDIR(info.st_mode):
+        return f"{path} exists but is not a directory"
+    if os.name == "posix":
+        if info.st_uid != os.getuid():
+            return f"{path} is owned by another user (uid {info.st_uid}); choose another worktree_dir"
+        if info.st_mode & 0o077:
+            return f"{path} has mode {stat.S_IMODE(info.st_mode):04o}; run: chmod 700 {path}"
+    return ""
 
 
 # ---- validation --------------------------------------------------------------------------------
@@ -141,6 +182,11 @@ def _read_toml(path: pathlib.Path) -> dict[str, Any] | None:
         raise ConfigError(f"{path}: invalid TOML: {exc}") from exc
 
 
+def _anchor(value: str, base: str) -> str:
+    value = os.path.expanduser(value)
+    return value if os.path.isabs(value) else os.path.join(base, value)
+
+
 def _normalize_agy_path(value: object) -> list[str]:
     return [value] if isinstance(value, str) else list(value)  # type: ignore[call-overload]
 
@@ -150,8 +196,13 @@ def load_config(main_root: str | None, overrides: dict[str, object] | None = Non
     values: dict[str, Any] = {k: getattr(Config(), k) for k in CONFIG_KEYS}
     sources: dict[str, str] = {k: "default" for k in CONFIG_KEYS}
 
-    def apply(label: str, layer: dict[str, Any]) -> None:
+    def apply(label: str, layer: dict[str, Any], base: str) -> None:
+        # Relative paths mean "relative to the file that set them" (the cwd for CLI overrides).
         for key, value in _validate_layer(label, layer).items():
+            if key == "worktree_dir" and value:
+                value = _anchor(value, base)
+            elif key == "deny_write":
+                value = [_anchor(v, base) for v in value]
             values[key] = value
             sources[key] = label
 
@@ -162,7 +213,7 @@ def load_config(main_root: str | None, overrides: dict[str, object] | None = Non
     for label, path in layers:
         data = _read_toml(path)
         if data is not None:
-            apply(label, data)
+            apply(label, data, str(path.parent))
 
     env_agy = os.environ.get("AGW_AGY")
     if env_agy:   # an empty value is treated as unset
@@ -170,12 +221,11 @@ def load_config(main_root: str | None, overrides: dict[str, object] | None = Non
         sources["agy_path"] = "env"
 
     if overrides:
-        apply("cli", {k: v for k, v in overrides.items() if v is not None})
+        apply("cli", {k: v for k, v in overrides.items() if v is not None}, os.getcwd())
 
     values["agy_path"] = _normalize_agy_path(values["agy_path"])
     worktree_dir = values["worktree_dir"]
-    values["worktree_dir"] = (os.path.realpath(os.path.expanduser(worktree_dir))
-                              if worktree_dir else default_worktree_dir())
+    values["worktree_dir"] = _real_parent(os.path.expanduser(worktree_dir)) if worktree_dir else default_worktree_dir()
     values["deny_write"] = [os.path.realpath(os.path.expanduser(p)) for p in values["deny_write"]]
     values["accept"] = list(values["accept"])
     values["setup"] = list(values["setup"])

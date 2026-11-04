@@ -106,6 +106,7 @@ def agw_env(tmp_path: pathlib.Path, git_repo: pathlib.Path, monkeypatch: pytest.
     systmp = root / "systmp"
     for d in (outside, worktree_dir, state_dir, systmp):
         d.mkdir()
+        d.chmod(0o700)
     env = AgwEnv(
         root=root, repo=git_repo, config_path=root / "config.toml",
         worktree_dir=pathlib.Path(real(worktree_dir)), outside=pathlib.Path(real(outside)),

@@ -118,8 +118,41 @@ def test_worktree_dir_and_deny_write_are_normalized(isolated, tmp_path):
     isolated.write_text(toml_dumps({"worktree_dir": str(link), "deny_write": [str(link / "x"), "~/.foo"]}),
                         encoding="utf-8")
     cfg = load_config(None)
-    assert cfg.worktree_dir == str(real)
+    assert cfg.worktree_dir == str(link)          # a symlink stays visible so run/doctor can reject it
     assert cfg.deny_write == [str(real / "x"), os.path.realpath(os.path.expanduser("~/.foo"))]
+
+
+def test_relative_paths_resolve_against_the_config_file_directory(isolated, tmp_path, monkeypatch):
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".agw.toml").write_text(toml_dumps({"worktree_dir": "wts", "deny_write": ["secret", "../up"]}),
+                                       encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    cfg = load_config(str(project))
+    assert cfg.worktree_dir == str(project / "wts")
+    assert cfg.deny_write == [str(project / "secret"), str(tmp_path / "up")]
+    cli = load_config(str(project), {"worktree_dir": "from-cli"})
+    assert cli.worktree_dir == str(elsewhere / "from-cli")
+
+
+def test_worktree_dir_problem_checks(tmp_path):
+    from agw.config import worktree_dir_problem
+    fresh = tmp_path / "a" / "wts"
+    assert worktree_dir_problem(str(fresh), create=True) == ""
+    assert (os.stat(fresh).st_mode & 0o777) == 0o700
+    assert worktree_dir_problem(str(tmp_path / "missing")) == ""
+    link = tmp_path / "ln"
+    link.symlink_to(fresh)
+    assert "symlink" in worktree_dir_problem(str(link))
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    os.chmod(loose, 0o755)
+    assert "chmod 700" in worktree_dir_problem(str(loose))
+    f = tmp_path / "file"
+    f.write_text("x", encoding="utf-8")
+    assert "not a directory" in worktree_dir_problem(str(f))
 
 
 def test_empty_worktree_dir_means_default(isolated):
