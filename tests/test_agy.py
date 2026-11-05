@@ -350,6 +350,9 @@ CASES = [
     ("auth status", O(agy_error={"status": "UNAUTHENTICATED"}), "", {}, "auth"),
     ("auth permission", O(agy_error={"status": "PERMISSION_DENIED"}), "", {}, "auth"),
     ("auth please log in", O(), "Please sign in to continue", {}, "auth"),
+    # Verbatim from agy 1.5.0 on a machine that was never logged in (it waits 60 s for a pasted code first).
+    ("auth never logged in", O(error="authentication failed or timed out"),
+     "Authentication required. Please visit the URL to log in:\nerror: authentication failed or timed out", {}, "auth"),
     ("model", O(error="invalid model selection (--model x)"), "", {}, "model"),
     ("other", O(error="kaboom"), "", {}, "error"),
     ("missing", O(status="MISSING", error="agy exited 1 without a result"), "", {}, "error"),

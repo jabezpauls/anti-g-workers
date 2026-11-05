@@ -185,3 +185,22 @@ Observed through `agw` in throwaway git repos under a scratch dir in `/tmp`, mod
 - **SIGINT to agw**: both agy processes were terminated, the shell child `sleep 100` did not survive, agw exited 130
   within about 0.5 s and the summary was printed (`error: interrupted: interrupted`).
 - **Token use** of tiny workers on `gemini-3.8-flash-low`: 16k-62k input tokens per run, 0-1k output.
+
+## Round 4: not-logged-in behaviour, `agy` 1.5.0, Linux (fresh remote machine), 2026-11-05
+
+Freshly installed via `curl -fsSL https://antigravity.google/cli/install.sh | bash` (installs to `~/.local/bin/agy`
+and appends a PATH line to `~/.bashrc`) and never logged in:
+
+- `agy -p ... --output-format json` prints `Authentication required. Please visit the URL to log in:` with a Google
+  OAuth URL, then `Waiting for authentication (timeout 60s)...` / `Or, paste the authorization code here and press
+  Enter:` on stderr, and **blocks for up to 60 s** before giving up. With stdin at EOF it gives up immediately with
+  `Error: authentication interrupted.`
+- It then prints `error: authentication failed or timed out` and the envelope
+  `{"conversation_id":"","status":"ERROR","error":"authentication failed or timed out","num_turns":0,...}`.
+- agw classifies this as `auth` (matches `authentication failed`), so the run aborts with exit 3 and doesn't retry.
+- Verified the way agw calls it (brief piped on stdin, then EOF, with `--output-format stream-json`): agy fails in
+  **0 s**, exit 1, stderr `Error: authentication required. Run 'agy' to log in, then retry.`, and a stream with only a
+  `result` event (`status:"ERROR"`, `error:"authentication failed or timed out"`). `agw doctor --live` reports
+  `FAIL live: auth: authentication failed or timed out`. So workers never block on the 60 s login wait.
+- To log in on a headless machine: run `agy` interactively, open the printed URL in any browser, and paste the
+  authorization code back into the terminal.
